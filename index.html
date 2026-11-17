@@ -1,0 +1,3071 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>后宫传 · 承熙宫词</title><style>html,body{margin:0;height:100%;background:#1b1418;overflow:hidden}body{display:flex;justify-content:center;align-items:center}canvas{display:block;touch-action:none;box-shadow:0 0 60px rgba(0,0,0,.6)}</style></head><body><canvas id="game"></canvas><script>window.__AUDIO_BASE__="audio/";
+var __m={},__c={};function __d(n,f){__m[n]=f}function __r(n){if(__c[n])return __c[n].exports;var m=__c[n]={exports:{}};__m[n](function(p){return __r(__res(n,p))},m,m.exports);return m.exports}function __res(b,p){var s=b.split("/");s.pop();p.split("/").forEach(function(x){if(x==="..")s.pop();else if(x!==".")s.push(x)});return s.join("/")}
+__d("./js/audio",function(require,module,exports){
+// 配乐与音效。微信/抖音用 InnerAudioContext，浏览器用 <audio>；文件在 audio/ 下
+var P = require('./platform');
+var BGM_VOL = 0.55, SFX_VOL = 0.8;
+var A = { hold: false, on: true, want: null, cur: null, vol: 0, set: -1, duck: 0, touched: false, t: 0 };
+var pool = {};
+function get(name, loop) {
+  if (!pool[name]) { var a = P.createAudio(); a.src = P.audioBase + name + '.mp3'; a.loop = !!loop; pool[name] = a; }
+  return pool[name];
+}
+function play(a) { try { var r = a.play(); if (r && r.catch) r.catch(function () {}); } catch (e) {} }
+function stop(a) { try { if (a.stop) a.stop(); else { a.pause(); a.currentTime = 0; } } catch (e) {} }
+function setVol(a, v) { try { a.volume = v; } catch (e) {} }
+
+A.bgm = function (name) { A.want = name; };
+A.sfx = function (name, vol) {
+  if (!A.on) return;
+  var a = get('sfx_' + name); stop(a); setVol(a, vol || SFX_VOL); play(a);
+};
+A.duckFor = function (frames) { A.duck = frames; };
+A.toggle = function () { A.on = !A.on; if (!A.on) for (var k in pool) if (k.indexOf('sfx_') === 0) stop(pool[k]); return A.on; };
+// 浏览器要等用户第一次触摸后才允许出声
+A.touch = function () { if (!A.touched) { A.touched = true; A.set = -1; if (A.cur && A.on) play(get('bgm_' + A.cur, true)); } };
+// 每帧调用：处理淡入淡出与切歌
+A.tick = function () {
+  if (A.hold) { if (A.cur) { var h = get('bgm_' + A.cur, true); if (h.paused === false) try { h.pause(); } catch (e) {} } A.set = -1; return; }
+  A.t++; if (A.duck > 0) A.duck--;
+  var target = !A.on ? 0 : (A.duck > 0 ? BGM_VOL * 0.2 : BGM_VOL);
+  if (A.cur !== A.want) {
+    A.vol = Math.max(0, A.vol - 0.03);
+    if (A.vol <= 0 || !A.cur) {
+      if (A.cur) stop(get('bgm_' + A.cur, true));
+      A.cur = A.want; A.vol = 0; A.set = -1;
+      if (A.cur) { var a = get('bgm_' + A.cur, true); setVol(a, 0); if (A.on) play(a); }
+    }
+  } else if (A.vol < target) A.vol = Math.min(target, A.vol + 0.012);
+  else if (A.vol > target) A.vol = Math.max(target, A.vol - 0.03);
+  if (A.cur && Math.abs(A.vol - A.set) > 0.015) { A.set = A.vol; setVol(get('bgm_' + A.cur, true), A.vol); }
+  if (A.cur && A.on && A.t % 45 === 0) { var c = get('bgm_' + A.cur, true); if (c.paused) play(c); }
+  if (A.cur && !A.on && A.vol <= 0 && A.t % 45 === 0) { var c2 = get('bgm_' + A.cur, true); if (c2.paused === false) c2.pause(); }
+};
+P.onHideShow(function () { if (A.cur) try { get('bgm_' + A.cur, true).pause(); } catch (e) {} }, function () { if (A.cur && A.on) play(get('bgm_' + A.cur, true)); });
+module.exports = A;
+
+});
+__d("./js/config",function(require,module,exports){
+// 上线配置：在两个平台的后台各自开通广告后，把广告位 ID 填到这里
+module.exports = {
+  wx: {                       // 微信公众平台 → 流量主 → 广告管理
+    rewarded: '',             // 激励视频广告位，形如 adunit-xxxxxxxxxxxx
+    interstitial: ''          // 插屏广告位（可留空 = 不放插屏）
+  },
+  tt: {                       // 抖音开放平台 → 小游戏 → 流量主
+    rewarded: '',
+    interstitial: ''
+  },
+  interstitialFromChapter: 2, // 从第几章的章节切换开始放插屏
+  interstitialGapSec: 120,    // 两次插屏至少间隔多少秒
+  // 广告位没填时，是否用“示意广告”（倒计时 3 秒）代替，方便测试。正式上线前改成 false
+  mockAdsWhenUnset: true,
+  shareTitle: '入宫一步，生死由己。你会走到哪一种结局？'
+};
+
+});
+__d("./js/main",function(require,module,exports){
+// 《后宫传 · 承熙宫词》 主程序：界面、剧情解释器、存档
+var P = require('./platform');
+var Portrait = require('./portrait');
+var Scenery = require('./scenery');
+var D = require('./story/index');
+var Audio2 = require('./audio');
+var U = Portrait.util;
+
+var canvas = P.canvas, ctx = canvas.getContext('2d');
+var W = 750, H = 1334, K = 1;
+function layout() { var s = P.size(); K = s.sw * s.dpr / W; H = W * s.sh / s.sw; }
+layout(); P.onResize = layout;
+
+var INK = '#3a2a2e', PAPER = '#fbf5ea', GOLD = '#c9a25a', RED = '#b8444e', MINT = '#5fa894';
+var STAT = { jia: '家世', mao: '容貌', cai: '才艺', zhi: '智谋', chong: '圣宠', wang: '威望', yin: '银两' };
+var WHO = { wt: '晚棠', gf: '顾明珠', hh: '皇后', th: '太后', hd: '皇上', sy: '苏砚', ar: '阿箬', ys: '云氏', rg: '容姑姑' };
+
+// ───────── 全局状态 ─────────
+var meta = P.load('hgz_meta') || { ach: {}, ends: {}, runs: 0 };
+if (meta.mute) Audio2.on = false;
+var BGMAP = { title: 'theme', gate: 'theme', garden: 'theme', room: 'theme', study: 'theme', hall: 'court', night: 'night', cold: 'cold' };
+var S = null;                       // 本局存档
+var G = { screen: 'title', scroll: 0, maxScroll: 0, tab: 0, toasts: [], t: 0, newAch: [] };
+var R = { stack: [], line: null, choices: null, typed: 0, bg: 'gate', card: null };
+var C = { step: 0, origin: 'sx', name: '', pts: 30, add: { jia: 0, mao: 0, cai: 0, zhi: 0 } };
+var btns = [];
+
+function newState() {
+  var o = D.ORIGINS[C.origin];
+  var s = { name: C.name, xing: C.name.charAt(0), origin: C.origin, jia: 10, mao: 10, cai: 10, zhi: 10, chong: 0, wang: 0, yin: o.yin, ren: 0, rank: 0, ch: 0, ap: 0, aff: { wt: 0, gf: 0, hh: 0, th: 0, hd: 0, sy: 0, ar: 0, ys: 0, rg: 0 }, f: {}, items: [], done: {}, ach: [] };
+  for (var k in o.add) s[k] += o.add[k];
+  for (var a in C.add) s[a] += C.add[a];
+  return s;
+}
+function saveGame() { if (S) P.save('hgz_save', S); }
+function saveMeta() { P.save('hgz_meta', meta); }
+function toast(t, col) { G.toasts.push({ t: t, life: 150, col: col || INK }); if (G.toasts.length > 6) G.toasts.shift(); }
+function unlockAch(id) {
+  if (S && S.ach.indexOf(id) < 0) S.ach.push(id);
+  if (meta.ach[id]) return;
+  meta.ach[id] = 1; saveMeta();
+  var a = D.ACH_MAP[id]; if (a) { toast('成就达成 · ' + a.name, '#a0701a'); Audio2.sfx('ach'); }
+}
+function has(it) { return S.items.indexOf(it) >= 0; }
+function fmt(t) {
+  if (!S) return t;
+  return t.replace(/\{name\}/g, S.name).replace(/\{xing\}/g, S.xing).replace(/\{rank\}/g, D.RANKS[S.rank]).replace(/\{cheng\}/g, S.xing + D.RANKS[S.rank]);
+}
+function applyEffects(e) {
+  var shown = false;
+  for (var k in e) {
+    var v = e[k];
+    if (k in S.aff) { S.aff[k] += v; if (Math.abs(v) >= 3) toast(WHO[k] + (v > 0 ? ' 对你的心意更近了' : ' 与你生了嫌隙'), v > 0 ? '#a04a66' : '#5a6072'); }
+    else {
+      S[k] = Math.max(k === 'ren' ? -99 : 0, Math.min(k === 'yin' ? 999 : (k === 'ren' ? 99 : 100), S[k] + v));
+      if (STAT[k]) { toast(STAT[k] + (v > 0 ? ' +' : ' ') + v, v > 0 ? '#2f7a66' : '#a03a44'); shown = true; }
+    }
+  }
+  if (shown) Audio2.sfx('chime', 0.5);
+  if (S.mao >= 90) unlockAch('qingguo'); if (S.cai >= 90) unlockAch('yongxu'); if (S.zhi >= 90) unlockAch('zhuge');
+}
+function promo() {
+  var need = [0, 20, 45, 75, 105, 135, 170];
+  var up = false;
+  while (S.rank < 6 && S.chong + S.wang >= need[S.rank + 1]) { S.rank++; up = true; if (S.rank - (S.f._r0 || 0) >= 2) break; }
+  S.f._r0 = S.rank;
+  if (S.rank >= 6 && S.ch <= 4) unlockAch('dengtian');
+  return up;
+}
+
+// ───────── 剧情解释器 ─────────
+function run(steps, onDone) { R.bgm = null; R.stack = [{ a: steps, i: 0 }]; R.onDone = onDone; R.line = null; R.choices = null; R.card = null; G.screen = 'dialog'; step(); }
+function step() {
+  R.line = null; R.choices = null; R.card = null;
+  for (;;) {
+    var f = R.stack[R.stack.length - 1];
+    if (!f) { var cb = R.onDone; R.onDone = null; if (cb) cb(); return; }
+    if (f.i >= f.a.length) { R.stack.pop(); continue; }
+    var st = f.a[f.i++];
+    if (typeof st === 'string') { R.line = { who: null, text: fmt(st) }; R.typed = 0; return; }
+    if (st instanceof Array) { R.line = { who: st[0], text: fmt(st[1]), ex: st[2] || 'n' }; R.typed = 0; return; }
+    if (st.c) {
+      var list = [];
+      for (var i = 0; i < st.c.length; i++) { var o = st.c[i]; if (o.if && !o.if(S)) continue; list.push({ t: fmt(o.t), ok: !o.req || !!o.req(S), tip: o.tip, do: o.do || [] }); }
+      R.choices = list; R.prompt = st.q ? fmt(st.q) : null; return;
+    }
+    if (st.if) { var br = st.if(S) ? st.then : st.else; if (br) R.stack.push({ a: br, i: 0 }); continue; }
+    if (st.e) applyEffects(st.e);
+    if (st.f) { if (typeof st.f === 'string') S.f[st.f] = 1; else for (var k in st.f) S.f[k] = st.f[k]; }
+    if (st.inc) S.f[st.inc] = (S.f[st.inc] || 0) + 1;
+    if (st.item && !has(st.item)) { S.items.push(st.item); toast('获得 · ' + st.item, '#7a5a1a'); Audio2.sfx('bell'); }
+    if (st.drop) { var ix = S.items.indexOf(st.drop); if (ix >= 0) { S.items.splice(ix, 1); toast('失去 · ' + st.drop, '#5a6072'); } }
+    if (st.ach) unlockAch(st.ach);
+    if (st.bg) { R.bg = st.bg; R.bgm = null; }
+    if (st.bgm !== undefined) R.bgm = st.bgm || null;
+    if (st.sfx) { Audio2.sfx(st.sfx); if (st.sfx === 'zheliu') Audio2.duckFor(680); }
+    if (st.rank != null) S.rank = Math.max(S.rank, st.rank);
+    if (st.promo) { var before = S.rank; if (promo()) { R.stack.push({ a: ['一道旨意晓谕六宫：晋{xing}氏为' + D.RANKS[S.rank] + '。'], i: 0 }); } if (S.rank === before && st.promo === 2) { /* 无晋封 */ } }
+    if (st.ch != null) { S.ch = st.ch; var chd = D.CHAPTERS[st.ch]; S.ap = chd.ap; if (st.ch > 1) { var pay = 15 + S.rank * 6; S.yin += pay; toast('月例 银两 +' + pay, '#7a5a1a'); } }
+    if (st.fn) st.fn(S);
+    if (st.go) { R.stack = [{ a: D.SCENES[st.go], i: 0 }]; continue; }
+    if (st.title) { R.card = { title: st.title, sub: st.sub || '' }; R.bgm = null; Audio2.sfx('gong'); if (S && S.ch >= (P.cfg.interstitialFromChapter || 2)) P.showInterstitial(); return; }
+    if (st.end) { ending(st.end); return; }
+  }
+}
+function choose(o) { if (!o.ok) { toast(o.tip || '此路不通'); return; } Audio2.sfx('pick'); R.choices = null; R.stack.push({ a: o.do, i: 0 }); step(); }
+function tapDialog() {
+  if (R.card) { step(); return; }
+  if (R.choices) return;
+  if (!R.line) return;
+  if (R.typed < R.line.text.length) { R.typed = R.line.text.length; return; }
+  Audio2.sfx('tap', 0.5);
+  step();
+}
+function ending(id) {
+  var first = !meta.ends[id];
+  meta.ends[id] = 1; meta.runs = (meta.runs || 0) + 1;
+  var n = 0; for (var k in meta.ends) n++;
+  saveMeta();
+  if (D.ENDS[id].good !== 0 && S.f.arFree && !S.f.arDead) unlockAch('bufu');
+  if ((id === 'huanghou' || id === 'chongguan' || id === 'nvdi') && S.f.arDead && S.f.gfDead && (S.f.wtDead || S.f.exposedWt) && S.f.hhDeposed) unlockAch('guajia');
+  if (n >= 5) unlockAch('fanhua'); if (n >= D.END_LIST.length) unlockAch('ming');
+  G.end = { id: id, first: first, ach: S.ach.slice() }; G.card = null; G.cardPath = '';
+  P.save('hgz_save', null); S.over = 1;
+  G.screen = 'ending'; G.scroll = 0; Audio2.sfx('gong');
+}
+function goMap() { G.screen = 'map'; G.scroll = 0; saveGame(); }
+function startChapterIfNeeded() { goMap(); }
+
+function visit(loc) {
+  var main = D.MAIN[S.ch];
+  if (main && main.loc === loc.id && (S.f._mainAsk !== S.ch || true)) {
+    // 主线地点：先问是否推进
+    R.bg = loc.bg;
+    run([{ q: '「' + main.label + '」——此去便是这一章的转折，未竟之事将不可再追。', c: [
+      { t: '前去（推进主线）', do: [{ fn: function () { R.stack = [{ a: main.scene, i: 0 }]; } }] },
+      S.ap > 0 ? { t: '只在此处走走（消耗一次余暇）', do: [{ fn: function () { doLocal(loc, true); } }] } : { t: '再等等', do: [] }
+    ] }], afterEvent);
+    return;
+  }
+  if (S.ap <= 0) { toast('这一旬的余暇已尽，该去赴「' + main.label + '」了'); return; }
+  doLocal(loc, false);
+}
+function doLocal(loc, nested) {
+  var evs = D.EVENTS[loc.id] || [], ev = null;
+  for (var i = 0; i < evs.length; i++) { var e = evs[i]; if (S.done[e.id]) continue; if (e.when && !e.when(S)) continue; ev = e; break; }
+  var steps;
+  if (ev) { S.done[ev.id] = 1; steps = ev.scene; if (!ev.free) S.ap--; }
+  else { var df = D.DEFAULTS[loc.id]; steps = typeof df === 'function' ? df(S) : df; if (!(steps.free)) S.ap--; }
+  R.bg = loc.bg;
+  if (nested) { R.stack = [{ a: steps, i: 0 }]; }
+  else run(steps, afterEvent);
+}
+function afterEvent() { if (S && !S.over) goMap(); }
+
+// ───────── 绘图工具 ─────────
+function font(px, bold) { ctx.font = (bold ? 'bold ' : '') + px + 'px ' + P.FONT; }
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r); ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h); ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath(); }
+function panel(x, y, w, h, a) {
+  rr(x, y, w, h, 18); ctx.fillStyle = 'rgba(251,245,234,' + (a == null ? 0.94 : a) + ')'; ctx.fill();
+  ctx.strokeStyle = GOLD; ctx.lineWidth = 2.5; ctx.stroke();
+  rr(x + 8, y + 8, w - 16, h - 16, 12); ctx.strokeStyle = 'rgba(201,162,90,.45)'; ctx.lineWidth = 1; ctx.stroke();
+}
+var NOHEAD = '，。！？；：、”’）》…—';
+function wrap(text, maxW) {
+  var lines = [], cur = '';
+  for (var i = 0; i < text.length; i++) {
+    var ch = text.charAt(i);
+    if (ch === '\n') { lines.push(cur); cur = ''; continue; }
+    if (ctx.measureText(cur + ch).width > maxW && NOHEAD.indexOf(ch) < 0) { lines.push(cur); cur = ch; } else cur += ch;
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+function text(t, x, y, px, col, align, bold) { font(px, bold); ctx.fillStyle = col || INK; ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle'; ctx.fillText(t, x, y); }
+function para(t, x, y, w, px, col, lh, maxChars) {
+  font(px); ctx.fillStyle = col || INK; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  var ls = wrap(t, w), n = 0; lh = lh || px * 1.6;
+  for (var i = 0; i < ls.length; i++) {
+    var s = ls[i];
+    if (maxChars != null) { if (n >= maxChars) break; if (n + s.length > maxChars) s = s.substr(0, maxChars - n); n += ls[i].length; }
+    ctx.fillText(s, x, y + i * lh);
+  }
+  return ls.length * lh;
+}
+function button(x, y, w, h, label, fn, o) {
+  o = o || {};
+  rr(x, y, w, h, o.r || h / 2);
+  ctx.fillStyle = o.dis ? 'rgba(220,214,204,.9)' : (o.fill || U.lin(ctx, 0, y, 0, y + h, [0, '#fffaf0', 1, '#f3e6cf'])); ctx.fill();
+  ctx.strokeStyle = o.dis ? '#b9b2a6' : (o.stroke || GOLD); ctx.lineWidth = 2.5; ctx.stroke();
+  text(label, x + w / 2, y + h / 2 + 1, o.px || 32, o.dis ? '#9a948a' : (o.col || INK), 'center', o.bold);
+  if (fn) btns.push({ x: x, y: y, w: w, h: h, fn: fn });
+}
+function hit(x, y, w, h, fn) { btns.push({ x: x, y: y, w: w, h: h, fn: fn }); }
+function drawBg(name) { ctx.drawImage(Scenery.get(name, W, H), 0, 0, W, H); }
+
+var petals = [];
+for (var pi = 0; pi < 16; pi++) petals.push({ x: Math.random() * 750, y: Math.random() * 1600, s: 5 + Math.random() * 7, v: 0.6 + Math.random() * 1.1, p: Math.random() * 6 });
+function drawPetals(col) {
+  for (var i = 0; i < petals.length; i++) {
+    var p = petals[i]; p.y += p.v; p.x += Math.sin(G.t / 60 + p.p) * 0.7; if (p.y > H + 20) { p.y = -20; p.x = Math.random() * W; }
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(G.t / 50 + p.p); ctx.fillStyle = col || 'rgba(246,170,186,.75)';
+    ctx.beginPath(); ctx.ellipse(0, 0, p.s, p.s * 0.55, 0, 0, 6.3); ctx.fill(); ctx.restore();
+  }
+}
+function drawToasts() {
+  var y = 150;
+  for (var i = 0; i < G.toasts.length; i++) {
+    var t = G.toasts[i]; t.life--;
+    var a = Math.min(1, t.life / 30); font(26, true); var tw = ctx.measureText(t.t).width + 56;
+    ctx.globalAlpha = a; rr(W / 2 - tw / 2, y, tw, 50, 25); ctx.fillStyle = 'rgba(255,251,240,.96)'; ctx.fill(); ctx.strokeStyle = GOLD; ctx.lineWidth = 1.5; ctx.stroke();
+    text(t.t, W / 2, y + 26, 26, t.col, 'center', true); ctx.globalAlpha = 1; y += 60;
+  }
+  G.toasts = G.toasts.filter(function (t) { return t.life > 0; });
+}
+function titleArt(x, y, size) {
+  // 竖排题字 + 印章
+  var chars = ['后', '宫', '传'];
+  for (var i = 0; i < 3; i++) { ctx.shadowColor = 'rgba(255,255,255,.9)'; ctx.shadowBlur = 16; text(chars[i], x, y + i * size * 1.12, size, '#4a2a30', 'center', true); }
+  ctx.shadowBlur = 0;
+  rr(x + size * 0.72, y + size * 1.9, 46, 96, 6); ctx.fillStyle = RED; ctx.fill();
+  text('承', x + size * 0.72 + 23, y + size * 1.9 + 26, 28, '#fff3e0', 'center', true); text('熙', x + size * 0.72 + 23, y + size * 1.9 + 68, 28, '#fff3e0', 'center', true);
+}
+
+// ───────── 各界面 ─────────
+// ───────── 广告、分享、录屏 ─────────
+function watchAd(why, reward) {
+  if (G.modal) return;
+  var r = P.showRewarded(function () { Audio2.hold = false; reward(); }, function (msg) { Audio2.hold = false; toast(msg || '广告暂不可用'); });
+  if (r === 'real') { Audio2.hold = true; return; }
+  if (r === 'none') { toast('广告暂不可用，稍后再试'); return; }
+  // 示意广告：网页版或未配置广告位时使用
+  G.modal = { kind: 'ad', t0: G.t, why: why, reward: reward };
+}
+function openModal(m) { G.modal = m; }
+function drawModal() {
+  var m = G.modal; if (!m) return;
+  hit(0, 0, W, H, function () {});
+  ctx.fillStyle = 'rgba(20,14,18,.82)'; ctx.fillRect(0, 0, W, H);
+  if (m.kind === 'ad') {
+    var left = Math.max(0, 3 - Math.floor((G.t - m.t0) / 60));
+    panel(70, H / 2 - 230, 610, 400);
+    text('激励视频 · 示意', W / 2, H / 2 - 170, 34, INK, 'center', true);
+    para('正式版这里会播放平台广告（约 15–30 秒）。完整看完后：' + m.why + '。', 110, H / 2 - 100, 530, 26, '#6a5a58', 40);
+    text(left > 0 ? left + '' : '✓', W / 2, H / 2 + 20, 64, RED, 'center', true);
+    if (left === 0) button(205, H / 2 + 80, 340, 74, '领取奖励', function () { G.modal = null; m.reward(); }, { bold: true });
+    else button(205, H / 2 + 80, 340, 74, '放弃奖励', function () { G.modal = null; toast('完整看完才能领取哦'); }, { px: 26, col: '#8a7a70' });
+    return;
+  }
+  var ih = 0;
+  if (m.img) { var iw = 640; ih = iw * m.img.height / m.img.width; ctx.drawImage(m.img, (W - iw) / 2, 120, iw, ih); ih += 30; }
+  var py = 120 + ih;
+  panel(55, py, 640, 110 + m.lines.length * 42 + m.btns.length * 96);
+  text(m.title, W / 2, py + 50, 32, INK, 'center', true);
+  for (var i = 0; i < m.lines.length; i++) text(m.lines[i], W / 2, py + 100 + i * 42, 24, '#6a5a58', 'center');
+  var by = py + 90 + m.lines.length * 42 + 10;
+  for (var j = 0; j < m.btns.length; j++) (function (b) { button(165, by, 420, 76, b.label, function () { G.modal = null; if (b.fn) b.fn(); }, { bold: !!b.main }); by += 96; })(m.btns[j]);
+}
+// 把立绘柔边裁切后画上去（去掉光晕方框）
+function softPortrait(im, sx, sy, sw, sh, dx, dy, dw, dh) {
+  var t = P.createCanvas(Math.round(dw), Math.round(dh)), x = t.getContext('2d');
+  x.drawImage(im, sx, sy, sw, sh, 0, 0, dw, dh);
+  x.globalCompositeOperation = 'destination-in';
+  var g = x.createRadialGradient(dw / 2, dh * 0.42, 0, dw / 2, dh * 0.42, Math.max(dw, dh) * 0.62);
+  g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(0.62, 'rgba(0,0,0,1)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  x.fillStyle = g; x.fillRect(0, 0, dw, dh);
+  ctx.drawImage(t, dx, dy);
+}
+// 结局卡片：分享图与保存图共用（5:4，平台推荐的分享图比例）
+function endingCard() {
+  var CW = 1000, CH = 800, c = P.createCanvas(CW, CH), saved = ctx, savedK = K; ctx = c.getContext('2d');
+  var e = D.ENDS[G.end.id], ne = 0, na = 0; for (var k in meta.ends) ne++; for (var k2 in meta.ach) na++;
+  ctx.drawImage(Scenery.get(e.bg || 'night', W, H), 0, H * 0.18, W, W * 0.8, 0, 0, CW, CH);
+  ctx.fillStyle = U.lin(ctx, 0, 0, CW, 0, [0, 'rgba(24,16,22,.92)', 0.62, 'rgba(24,16,22,.7)', 1, 'rgba(24,16,22,.25)']); ctx.fillRect(0, 0, CW, CH);
+  var im = Portrait.get('me', e.good ? 's' : 'd'), Q = Portrait.Q; softPortrait(im, 40 * Q, 20 * Q, 560 * Q, 700 * Q, 540, 60, 480, 600);
+  ctx.fillStyle = U.lin(ctx, 0, 560, 0, CH, [0, 'rgba(24,16,22,0)', 1, 'rgba(24,16,22,.95)']); ctx.fillRect(0, 560, CW, 240);
+  text('后宫传 · 承熙宫词', 60, 70, 30, '#d9c9a8', 'left');
+  ctx.fillStyle = GOLD; ctx.fillRect(60, 100, 120, 3);
+  text('结局', 60, 170, 34, '#d9c9a8', 'left');
+  text(e.name, 56, 260, 96, '#f6e6c0', 'left', true);
+  text(S.name + ' · ' + D.RANKS[S.rank] + ' · ' + D.ORIGINS[S.origin].name, 60, 350, 30, '#e8a0a8', 'left', true);
+  font(28); var ls = wrap(fmt(e.epi), 560); for (var i = 0; i < Math.min(3, ls.length); i++) text(ls[i] + (i === 2 && ls.length > 3 ? '…' : ''), 60, 420 + i * 46, 28, '#e6dcc8', 'left');
+  text('已解锁结局 ' + ne + '/' + D.END_LIST.length + '　成就 ' + na + '/' + D.ACH.length, 60, 720, 28, '#bfb09a', 'left');
+  rr(870, 660, 70, 100, 8); ctx.fillStyle = RED; ctx.fill(); text('承', 905, 690, 36, '#fff3e0', 'center', true); text('熙', 905, 735, 36, '#fff3e0', 'center', true);
+  ctx = saved; K = savedK;
+  return c;
+}
+function shareTitleFor() {
+  if (G.screen === 'ending' && G.end) return '我在《后宫传》走到了「' + D.ENDS[G.end.id].name + '」，你会是哪一种？';
+  return P.cfg.shareTitle;
+}
+var defaultShareImg = '';
+P.setDefaultShare(function () {
+  if (G.screen === 'ending' && G.end) { if (!G.card) { G.card = endingCard(); G.cardPath = P.canvasToFile(G.card); } return { title: shareTitleFor(), imageUrl: G.cardPath || '', query: 'e=' + G.end.id }; }
+  return { title: P.cfg.shareTitle, imageUrl: defaultShareImg, query: '' };
+});
+function shareEnding() {
+  if (!G.card) { G.card = endingCard(); G.cardPath = P.canvasToFile(G.card); }
+  if (P.share({ title: shareTitleFor(), imageUrl: G.cardPath, query: 'e=' + G.end.id })) return;
+  openModal({ img: G.card, title: '分享我的结局', lines: ['网页版无法直接分享。', '在微信/抖音里，这里会弹出发送给好友的面板，', '并附上这张结局卡片。'], btns: [{ label: '保存这张卡片', fn: saveEndingCard, main: 1 }, { label: '关闭' }] });
+}
+function saveEndingCard() {
+  if (!G.card) { G.card = endingCard(); G.cardPath = P.canvasToFile(G.card); }
+  P.saveImage(G.card, function () { toast('结局卡片已保存', '#2f7a66'); }, function (msg) {
+    openModal({ img: G.card, title: msg, lines: ['可以截屏保存这张卡片。'], btns: [{ label: '知道了' }] });
+  });
+}
+function drawRecBtn() {
+  var on = P.rec.on, x = W - 96, y = 30;
+  ctx.beginPath(); ctx.arc(x + 36, y + 36, 34, 0, 6.3); ctx.fillStyle = on ? 'rgba(200,50,60,.92)' : 'rgba(255,250,240,.9)'; ctx.fill();
+  ctx.strokeStyle = on ? '#fff' : RED; ctx.lineWidth = 2.5; ctx.stroke();
+  if (on) { ctx.fillStyle = '#fff'; ctx.fillRect(x + 25, y + 25, 22, 22); text(Math.floor((Date.now() - P.rec.t0) / 1000) + 's', x + 36, y + 88, 22, '#fff', 'center', true); }
+  else { ctx.beginPath(); ctx.arc(x + 36, y + 36, 13, 0, 6.3); ctx.fillStyle = RED; ctx.fill(); text('录屏', x + 36, y + 88, 22, RED, 'center', true); }
+  hit(x, y, 72, 72, function () {
+    if (P.rec.on) { P.recStop(); return; }
+    P.recStart(function (path, ms) {
+      if (ms < 3500) { toast('录屏太短啦，至少 3 秒'); return; }
+      openModal({ title: '录屏完成', lines: ['把刚才的剧情发到抖音？'], btns: [{ label: '发布到抖音', main: 1, fn: function () { P.shareVideo(path, P.cfg.shareTitle, function () { toast('已取消发布'); }); } }, { label: '不发了' }] });
+    });
+    toast('开始录屏，再点一次结束（最长 5 分钟）');
+  });
+}
+function toggleSound() { meta.mute = Audio2.toggle() ? 0 : 1; saveMeta(); }
+function drawTitle() {
+  drawBg('title');
+  var im = Portrait.get('me', 'n'), ph = H * 0.86, pw = ph * Portrait.PW / Portrait.PH;
+  ctx.drawImage(im, W / 2 - pw / 2 + 110, H - ph * 0.86, pw, ph);
+  ctx.fillStyle = U.lin(ctx, 0, H - 520, 0, H, [0, 'rgba(251,245,234,0)', 0.55, 'rgba(251,245,234,.92)', 1, 'rgba(251,245,234,1)']); ctx.fillRect(0, H - 520, W, 520);
+  drawPetals();
+  titleArt(150, 190, 120);
+  text('承熙宫词', 150, 600, 30, '#6a4a4e', 'center');
+  var by = H - 400, sv = P.load('hgz_save');
+  button(165, by, 420, 84, '初入宫闱', function () { C.step = 0; C.name = D.randName(); C.pts = 30; C.add = { jia: 0, mao: 0, cai: 0, zhi: 0 }; G.screen = 'create'; G.scroll = 0; }, { bold: true });
+  button(165, by + 106, 420, 84, '再续前缘', sv ? function () { S = sv; goMap(); } : null, { dis: !sv });
+  button(165, by + 212, 420, 84, '宫闱图鉴', function () { G.screen = 'gallery'; G.back = 'title'; G.scroll = 0; G.tab = 0; });
+  button(590, 40, 130, 56, Audio2.on ? '乐 · 开' : '乐 · 关', toggleSound, { px: 24 });
+  var ne = 0, na = 0; for (var k in meta.ends) ne++; for (var k2 in meta.ach) na++;
+  text('结局 ' + ne + ' / ' + D.END_LIST.length + '　　成就 ' + na + ' / ' + D.ACH.length, W / 2, H - 50, 24, '#8a7a70', 'center');
+}
+
+function drawCreate() {
+  drawBg('garden'); ctx.fillStyle = 'rgba(251,245,234,.55)'; ctx.fillRect(0, 0, W, H);
+  if (C.step === 0) {
+    text('择 · 出身', W / 2, 96, 46, INK, 'center', true);
+    text('你的来处，决定你在这宫里看见什么', W / 2, 152, 26, '#7a6a66', 'center');
+    var y = 200, ids = D.ORIGIN_LIST;
+    for (var i = 0; i < ids.length; i++) {
+      (function (id) {
+        var o = D.ORIGINS[id], locked = o.lock && !meta.runs, sel = C.origin === id, h = 168;
+        panel(40, y, 670, h, sel ? 1 : 0.86);
+        if (sel) { rr(40, y, 670, h, 18); ctx.strokeStyle = RED; ctx.lineWidth = 4; ctx.stroke(); }
+        text(locked ? '？？？' : o.name, 76, y + 44, 34, sel ? RED : INK, 'left', true);
+        text(locked ? '' : o.tag, 680, y + 44, 24, MINT, 'right', true);
+        para(locked ? '此出身尚未解锁。走完任意一段人生后，或可得见。' : o.desc, 76, y + 92, 600, 25, '#6a5a58', 38);
+        if (!locked) hit(40, y, 670, h, function () { C.origin = id; });
+        y += h + 14;
+      })(ids[i]);
+    }
+    button(165, Math.max(y + 10, H - 130), 420, 84, '下一步', function () { C.step = 1; }, { bold: true });
+    text('‹ 返回', 70, 96, 28, '#7a6a66', 'left'); hit(20, 60, 160, 70, function () { G.screen = 'title'; });
+  } else {
+    var o2 = D.ORIGINS[C.origin], free = (o2.pts || 30) - C.add.jia - C.add.mao - C.add.cai - C.add.zhi;
+    text('定 · 禀赋', W / 2, 96, 46, INK, 'center', true);
+    var im = Portrait.get('me', 's'), Q = Portrait.Q; ctx.drawImage(im, 110 * Q, 30 * Q, 420 * Q, 400 * Q, 448, 150, 262, 250);
+    panel(40, 170, 400, 220);
+    text('闺名', 76, 216, 24, '#8a7a70'); text(C.name, 76, 272, 54, INK, 'left', true);
+    button(76, 318, 170, 52, '换个名字', function () { C.name = D.randName(); }, { px: 24 });
+    text(o2.name, 410, 216, 24, MINT, 'right', true);
+    panel(40, 420, 670, 520);
+    text('可分配点数', 76, 470, 28, '#6a5a58'); text('' + free, 674, 470, 40, free > 0 ? RED : MINT, 'right', true);
+    var ks = ['jia', 'mao', 'cai', 'zhi'], tips = { jia: '门第与人脉。许多门，只对有来历的人开。', mao: '第一眼的分量。圣宠之始，亦是祸端。', cai: '琴棋歌舞。能让人记住你，也能让人想起别人。', zhi: '看破与布局。宫里的真相从不摆在明处。' };
+    for (var j = 0; j < 4; j++) {
+      (function (k, yy) {
+        var base = 10 + (o2.add[k] || 0), v = base + C.add[k];
+        text(STAT[k], 76, yy, 34, INK, 'left', true); text(tips[k], 76, yy + 42, 22, '#8a7a70');
+        rr(190, yy - 9, 260, 18, 9); ctx.fillStyle = '#eadfcb'; ctx.fill(); rr(190, yy - 9, 260 * Math.min(1, v / 70), 18, 9); ctx.fillStyle = MINT; ctx.fill();
+        text('' + v, 500, yy, 34, INK, 'center', true);
+        button(540, yy - 30, 64, 60, '－', C.add[k] > 0 ? function () { C.add[k] -= 2; } : null, { dis: C.add[k] <= 0, r: 14 });
+        button(620, yy - 30, 64, 60, '＋', free >= 2 && v < 60 ? function () { C.add[k] += 2; } : null, { dis: !(free >= 2 && v < 60), r: 14 });
+      })(ks[j], 550 + j * 104);
+    }
+    text('初始银两 ' + o2.yin + ' 两', 410, 344, 22, '#8a7a70', 'right');
+    button(60, H - 130, 250, 84, '上一步', function () { C.step = 0; C.add = { jia: 0, mao: 0, cai: 0, zhi: 0 }; });
+    button(340, H - 130, 350, 84, free > 0 ? '尚有点数未用' : '入宫', free > 0 ? null : function () { S = newState(); R.bg = 'gate'; run(D.SCENES.prologue, afterEvent); }, { dis: free > 0, bold: true });
+  }
+}
+
+function statStrip(y) {
+  var ks = ['mao', 'cai', 'zhi', 'jia', 'chong', 'wang', 'yin'];
+  for (var i = 0; i < ks.length; i++) {
+    var x = 36 + i * 98; text(STAT[ks[i]], x + 44, y, 22, '#8a7a70', 'center'); text('' + S[ks[i]], x + 44, y + 36, 32, i >= 4 ? RED : INK, 'center', true);
+  }
+}
+function drawMap() {
+  drawBg(S.ch >= 5 ? 'cold' : 'garden'); ctx.fillStyle = 'rgba(251,245,234,.5)'; ctx.fillRect(0, 0, W, H);
+  drawPetals(S.ch >= 5 ? 'rgba(255,255,255,.9)' : null);
+  var ch = D.CHAPTERS[S.ch], main = D.MAIN[S.ch];
+  panel(24, 24, 702, 236);
+  text(ch.title, 56, 72, 36, INK, 'left', true); text(ch.time, 694, 72, 24, '#8a7a70', 'right');
+  text(S.name + ' · ' + D.RANKS[S.rank], 56, 124, 28, RED, 'left', true);
+  if (S.ap <= 0 && !S.f['adAp' + S.ch]) {
+    button(452, 98, 252, 54, '▶ 看视频 · 余暇+1', function () { watchAd('多得一次余暇', function () { S.f['adAp' + S.ch] = 1; S.ap += 1; toast('余暇 +1', '#2f7a66'); saveGame(); }); }, { px: 24, fill: '#fbe9d4', stroke: RED, col: RED, bold: true });
+  } else text('余暇', 470, 124, 24, '#8a7a70');
+  if (!(S.ap <= 0 && !S.f['adAp' + S.ch])) for (var a = 0; a < ch.ap; a++) { ctx.beginPath(); ctx.arc(546 + a * 30, 124, 10, 0, 6.3); ctx.fillStyle = a < S.ap ? RED : '#e2d6c2'; ctx.fill(); }
+  statStrip(178);
+  var top = 280, bh = 104, gap = 12, avail = H - 150 - top, rows = Math.ceil(D.LOCS.length / 2);
+  bh = Math.max(84, Math.min(138, Math.floor(avail / rows) - gap));
+  for (var i = 0; i < D.LOCS.length; i++) {
+    (function (loc, i) {
+      var x = 24 + (i % 2) * 357, y = top + Math.floor(i / 2) * (bh + gap), isMain = main && main.loc === loc.id, dis = S.ap <= 0 && !isMain;
+      rr(x, y, 345, bh, 16); ctx.fillStyle = dis ? 'rgba(236,230,220,.8)' : 'rgba(255,251,242,.95)'; ctx.fill();
+      ctx.strokeStyle = isMain ? RED : GOLD; ctx.lineWidth = isMain ? 3.5 : 1.8; ctx.stroke();
+      ctx.beginPath(); ctx.arc(x + 54, y + bh / 2, 34, 0, 6.3); ctx.fillStyle = dis ? '#cfc8bc' : loc.col; ctx.fill();
+      text(loc.name.charAt(0), x + 54, y + bh / 2 + 2, 36, '#fffaf0', 'center', true);
+      text(loc.name, x + 104, y + bh / 2 - 18, 30, dis ? '#9a948a' : INK, 'left', true);
+      text(isMain ? main.label : loc.desc, x + 104, y + bh / 2 + 22, 21, isMain ? RED : '#8a7a70');
+      if (isMain) { rr(x + 262, y + 10, 72, 32, 16); ctx.fillStyle = RED; ctx.fill(); text('主线', x + 298, y + 27, 21, '#fff', 'center', true); }
+      hit(x, y, 345, bh, function () { visit(loc); });
+    })(D.LOCS[i], i);
+  }
+  var by = H - 120;
+  button(24, by, 160, 80, '人物', function () { G.screen = 'status'; G.scroll = 0; });
+  button(198, by, 160, 80, '图鉴', function () { G.screen = 'gallery'; G.back = 'map'; G.scroll = 0; G.tab = 0; });
+  button(372, by, 160, 80, Audio2.on ? '乐 · 开' : '乐 · 关', toggleSound, { px: 28 });
+  button(546, by, 180, 80, '存档离开', function () { saveGame(); G.screen = 'title'; }, { px: 28 });
+}
+
+function relWord(v) { return v >= 45 ? '生死相托' : v >= 30 ? '莫逆' : v >= 18 ? '亲近' : v >= 8 ? '相熟' : v > 0 ? '点头之交' : v < -5 ? '嫌隙' : '陌路'; }
+function drawStatus() {
+  drawBg('room'); ctx.fillStyle = 'rgba(251,245,234,.6)'; ctx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.translate(0, -G.scroll);
+  panel(24, 24, 702, 330);
+  var im = Portrait.get('me', 'n'), Q = Portrait.Q; ctx.drawImage(im, 110 * Q, 30 * Q, 420 * Q, 400 * Q, 440, 40, 270, 257);
+  text(S.name, 60, 84, 50, INK, 'left', true); text(D.RANKS[S.rank] + ' · ' + D.ORIGINS[S.origin].name, 60, 140, 26, RED, 'left', true);
+  var ks = ['mao', 'cai', 'zhi', 'jia', 'chong', 'wang'];
+  for (var i = 0; i < 6; i++) { var x = 60 + (i % 2) * 190, y = 196 + Math.floor(i / 2) * 48; text(STAT[ks[i]], x, y, 24, '#8a7a70'); text('' + S[ks[i]], x + 64, y, 30, INK, 'left', true); }
+  text('银两 ' + S.yin + ' 两', 60, 196 + 144 - 10, 24, '#7a5a1a');
+  var y2 = 380;
+  panel(24, y2, 702, 100 + Math.max(1, Math.ceil(S.items.length / 3)) * 50);
+  text('行囊', 56, y2 + 44, 30, INK, 'left', true);
+  if (!S.items.length) text('空空如也', 56, y2 + 96, 24, '#9a8a80');
+  for (var j = 0; j < S.items.length; j++) { var ix = 56 + (j % 3) * 220, iy = y2 + 96 + Math.floor(j / 3) * 50; rr(ix, iy - 20, 200, 40, 20); ctx.fillStyle = '#f3e6cf'; ctx.fill(); text(S.items[j], ix + 100, iy + 1, 24, '#6a4a1a', 'center'); }
+  y2 += 120 + Math.max(1, Math.ceil(S.items.length / 3)) * 50;
+  var ws = ['hd', 'hh', 'gf', 'wt', 'th', 'sy', 'ar', 'rg', 'ys'], met = { hd: 1, hh: 1, gf: 1, wt: 1, th: 1, ar: 1, rg: 1, sy: S.aff.sy > 0, ys: S.aff.ys > 0 };
+  panel(24, y2, 702, 80 + ws.length * 62);
+  text('宫中人', 56, y2 + 44, 30, INK, 'left', true);
+  for (var w = 0; w < ws.length; w++) {
+    var id = ws[w], yy = y2 + 104 + w * 62, v = S.aff[id];
+    text(met[id] ? D.FULL[id] : '？？？', 56, yy, 26, INK);
+    rr(330, yy - 8, 240, 16, 8); ctx.fillStyle = '#eadfcb'; ctx.fill();
+    if (met[id] && v > 0) { rr(330, yy - 8, 240 * Math.min(1, v / 50), 16, 8); ctx.fillStyle = '#d9808e'; ctx.fill(); }
+    text(met[id] ? relWord(v) : '', 694, yy, 24, '#a04a66', 'right');
+  }
+  y2 += 100 + ws.length * 62;
+  ctx.restore();
+  G.maxScroll = Math.max(0, y2 + 120 - H);
+  button(165, H - 110, 420, 80, '返回', function () { G.screen = 'map'; G.scroll = 0; });
+}
+
+function drawGallery() {
+  drawBg('study'); ctx.fillStyle = 'rgba(251,245,234,.72)'; ctx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.translate(0, -G.scroll);
+  var y = 170;
+  if (G.tab === 0) {
+    for (var i = 0; i < D.ACH.length; i++) {
+      var a = D.ACH[i], got = meta.ach[a.id];
+      panel(24, y, 702, 112, got ? 0.96 : 0.7);
+      ctx.beginPath(); ctx.arc(80, y + 56, 30, 0, 6.3); ctx.fillStyle = got ? (a.hard ? RED : GOLD) : '#d6cdbf'; ctx.fill();
+      text(got ? '✓' : '？', 80, y + 58, 30, '#fff', 'center', true);
+      text(got || !a.hide ? a.name : '？？？', 130, y + 38, 30, got ? INK : '#8a8078', 'left', true);
+      var clued = !got && a.hide && meta.clues && meta.clues[a.id];
+      text(got ? a.desc : (clued ? '签文：' + a.clue : (a.hide ? '隐藏成就——宫墙之内，总有未说出口的事。' : a.hint || a.desc)), 130, y + 78, 22, clued ? '#a04a66' : '#7a6a66');
+      if (a.hard) text('稀', 690, y + 38, 22, RED, 'right', true);
+      y += 124;
+    }
+  } else {
+    for (var j = 0; j < D.END_LIST.length; j++) {
+      var id = D.END_LIST[j], e = D.ENDS[id], g2 = meta.ends[id];
+      panel(24, y, 702, 132, g2 ? 0.96 : 0.7);
+      text(g2 ? '结局 · ' + e.name : '结局 · ？？？', 60, y + 44, 32, g2 ? RED : '#8a8078', 'left', true);
+      para(g2 ? e.epi.replace(/\{xing\}/g, '某') : e.hint, 60, y + 90, 630, 22, '#7a6a66', 32);
+      y += 144;
+    }
+  }
+  ctx.restore();
+  G.maxScroll = Math.max(0, y + 130 - H);
+  ctx.fillStyle = 'rgba(251,245,234,.96)'; ctx.fillRect(0, 0, W, 150);
+  button(60, 46, 300, 76, '成就', function () { G.tab = 0; G.scroll = 0; }, { fill: G.tab === 0 ? '#f3dcb8' : null, bold: G.tab === 0 });
+  button(390, 46, 300, 76, '结局', function () { G.tab = 1; G.scroll = 0; }, { fill: G.tab === 1 ? '#f3dcb8' : null, bold: G.tab === 1 });
+  var nextClue = null; for (var c = 0; c < D.ACH.length; c++) { var ac = D.ACH[c]; if (ac.hide && ac.clue && !meta.ach[ac.id] && !(meta.clues && meta.clues[ac.id])) { nextClue = ac; break; } }
+  if (G.tab === 0 && nextClue) {
+    button(40, H - 110, 300, 80, '返回', function () { G.screen = G.back || 'title'; G.scroll = 0; });
+    button(360, H - 110, 350, 80, '▶ 求签 · 得一条线索', function () { watchAd('求一支签，得一条隐藏成就的线索', function () { meta.clues = meta.clues || {}; meta.clues[nextClue.id] = 1; saveMeta(); toast('签文已写在图鉴里', '#a04a66'); Audio2.sfx('bell'); }); }, { px: 26, fill: '#fbe9d4', stroke: RED, col: RED, bold: true });
+  } else button(165, H - 110, 420, 80, '返回', function () { G.screen = G.back || 'title'; G.scroll = 0; });
+}
+
+function drawDialog() {
+  drawBg(R.bg);
+  var dark = Scenery.DARK[R.bg];
+  if (R.bg === 'garden' || R.bg === 'gate' || R.bg === 'title') drawPetals(); else if (R.bg === 'cold') drawPetals('rgba(255,255,255,.9)');
+  if (R.card) {
+    ctx.fillStyle = 'rgba(30,20,24,.82)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = GOLD; ctx.fillRect(W / 2 - 120, H / 2 - 92, 240, 2); ctx.fillRect(W / 2 - 120, H / 2 + 104, 240, 2);
+    text(R.card.title, W / 2, H / 2 - 30, 58, '#f6e6c0', 'center', true);
+    text(R.card.sub, W / 2, H / 2 + 50, 28, '#d9c9a8', 'center');
+    if (Math.floor(G.t / 40) % 2) text('轻触继续', W / 2, H - 120, 24, '#a89a88', 'center');
+    hit(0, 0, W, H, tapDialog);
+    return;
+  }
+  var bx = 24, bh = 330, by = H - bh - 40, bw = W - 48, L = R.line;
+  if (L && L.who && Portrait.CHARS[L.who]) {
+    var pid = L.who; if (pid === 'wt' && S.f.wtDark) pid = 'wt2'; if (pid === 'gf' && S.f.gfFall && S.ch === 3) pid = 'gf2';
+    var im = Portrait.get(pid, L.ex), sc = Math.min(1.55, (by - 40) / 508), pw = Portrait.PW * sc, ph = Portrait.PH * sc;
+    var px = (L.who === 'me' ? 430 : 330) - pw / 2, py = by - 558 * sc;
+    ctx.drawImage(im, px, py, pw, ph);
+  }
+  if (R.choices) {
+    ctx.fillStyle = 'rgba(30,20,24,.45)'; ctx.fillRect(0, 0, W, H);
+    font(30);
+    var n = R.choices.length, items = [], total = 0;
+    for (var i = 0; i < n; i++) { var ls = wrap(R.choices[i].t, 580); var h = 44 + ls.length * 42 + (R.choices[i].ok ? 0 : 30); items.push({ ls: ls, h: h }); total += h + 18; }
+    var y = Math.max(140, (H - total) / 2);
+    if (R.prompt) { font(28); var pl = wrap(R.prompt, 620); y = Math.max(120 + pl.length * 44, y); panel(40, y - pl.length * 44 - 70, 670, pl.length * 44 + 44); for (var q = 0; q < pl.length; q++) text(pl[q], 66, y - pl.length * 44 - 70 + 44 + q * 44, 28, INK); }
+    for (var j = 0; j < n; j++) {
+      (function (o, it) {
+        rr(50, y, 650, it.h, 18); ctx.fillStyle = o.ok ? 'rgba(255,251,240,.97)' : 'rgba(226,220,210,.92)'; ctx.fill(); ctx.strokeStyle = o.ok ? GOLD : '#a9a296'; ctx.lineWidth = 2.5; ctx.stroke();
+        for (var k = 0; k < it.ls.length; k++) text(it.ls[k], 84, y + 44 + k * 42, 30, o.ok ? INK : '#8a847a');
+        if (!o.ok) text('〔' + (o.tip || '条件不足') + '〕', 84, y + it.h - 28, 22, '#a05a5a');
+        hit(50, y, 650, it.h, function () { choose(o); });
+        y += it.h + 18;
+      })(R.choices[j], items[j]);
+    }
+    return;
+  }
+  if (!L) return;
+  panel(bx, by, bw, bh, 0.985);
+  if (L.who) {
+    var nm = L.who === 'me' ? S.name : (D.FULL[L.who] || L.who), right = L.who === 'me';
+    font(30, true); var nw = Math.max(150, ctx.measureText(nm).width + 60), nx = right ? bx + bw - nw - 30 : bx + 30;
+    rr(nx, by - 30, nw, 60, 30); ctx.fillStyle = right ? MINT : RED; ctx.fill(); ctx.strokeStyle = '#f6e6c0'; ctx.lineWidth = 2; ctx.stroke();
+    text(nm, nx + nw / 2, by + 1, 30, '#fffaf0', 'center', true);
+  }
+  R.typed = Math.min(L.text.length, R.typed + 1.2);
+  para(L.text, bx + 44, by + 78, bw - 88, 32, L.who ? INK : '#5a4a4e', 54, Math.floor(R.typed));
+  if (R.typed >= L.text.length && Math.floor(G.t / 30) % 2) { ctx.fillStyle = RED; ctx.beginPath(); ctx.moveTo(bx + bw - 60, by + bh - 44); ctx.lineTo(bx + bw - 40, by + bh - 44); ctx.lineTo(bx + bw - 50, by + bh - 30); ctx.fill(); }
+  hit(0, 0, W, H, tapDialog);
+}
+
+function drawEnding() {
+  var e = D.ENDS[G.end.id];
+  drawBg(e.bg || 'night'); ctx.fillStyle = 'rgba(24,16,22,.72)'; ctx.fillRect(0, 0, W, H);
+  drawPetals(e.good ? null : 'rgba(255,255,255,.7)');
+  ctx.save(); ctx.translate(0, -G.scroll);
+  text('结 局', W / 2, 150, 30, '#d9c9a8', 'center');
+  ctx.fillStyle = GOLD; ctx.fillRect(W / 2 - 100, 190, 200, 2);
+  text(e.name, W / 2, 280, 84, '#f6e6c0', 'center', true);
+  var y = 400; font(28); var ls = wrap(fmt(e.epi), 600);
+  for (var i = 0; i < ls.length; i++) text(ls[i], W / 2, y + i * 48, 28, '#e6dcc8', 'center');
+  y += ls.length * 48 + 50;
+  if (G.end.first) { text('—— 初次抵达此结局 ——', W / 2, y, 24, '#e0b060', 'center'); y += 60; }
+  text('此生所得成就', W / 2, y, 26, '#bfb09a', 'center'); y += 50;
+  if (!G.end.ach.length) { text('无', W / 2, y, 24, '#9a8f80', 'center'); y += 44; }
+  for (var j = 0; j < G.end.ach.length; j++) { var a = D.ACH_MAP[G.end.ach[j]]; if (!a) continue; text('◆ ' + a.name, W / 2, y, 28, a.hard ? '#f0a0a0' : '#f6e6c0', 'center'); y += 46; }
+  y += 20;
+  if (meta.runs === 1) { text('新的出身「罪臣之后」已解锁', W / 2, y, 24, '#9fd6c4', 'center'); y += 50; }
+  ctx.restore();
+  G.maxScroll = Math.max(0, y + 250 - H);
+  ctx.fillStyle = 'rgba(24,16,22,.85)'; ctx.fillRect(0, H - 236, W, 236);
+  button(60, H - 220, 300, 80, '分享我的结局', shareEnding, { px: 28, fill: '#fbe9d4', stroke: '#e0b060', col: RED, bold: true });
+  button(390, H - 220, 300, 80, '保存结局卡片', saveEndingCard, { px: 28 });
+  button(165, H - 120, 420, 84, '回到宫门之外', function () { S = null; G.screen = 'title'; G.scroll = 0; }, { bold: true });
+}
+
+function render() {
+  G.t++;
+  btns = [];
+  ctx.setTransform(K, 0, 0, K, 0, 0);
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+  var sc = G.screen; G.maxScroll = 0;
+  if (sc === 'title') drawTitle(); else if (sc === 'create') drawCreate(); else if (sc === 'map') drawMap();
+  else if (sc === 'dialog') drawDialog(); else if (sc === 'status') drawStatus(); else if (sc === 'gallery') drawGallery(); else if (sc === 'ending') drawEnding();
+  if (P.canRecord && sc === 'dialog') drawRecBtn();
+  drawModal();
+  drawToasts();
+  if (sc === 'title' || sc === 'create') Audio2.bgm('theme');
+  else if (sc === 'map') Audio2.bgm(S.ch >= 5 ? 'cold' : 'theme');
+  else if (sc === 'dialog') Audio2.bgm(R.bgm || BGMAP[R.bg] || 'theme');
+  else if (sc === 'ending') Audio2.bgm(D.ENDS[G.end.id].good ? 'theme' : 'night');
+  Audio2.tick();
+  P.raf(render);
+}
+
+// ───────── 输入 ─────────
+var tp = null;
+P.onTouch(function (x, y) { Audio2.touch(); tp = { x: x, y: y, s: G.scroll, moved: false }; },
+  function (x, y) { if (!tp) return; if (Math.abs(y - tp.y) > 8) tp.moved = true; if (tp.moved) G.scroll = Math.max(0, Math.min(G.maxScroll, tp.s - (y - tp.y) * W / P.size().sw)); },
+  function (x, y) {
+    if (!tp) return; var moved = tp.moved; tp = null; if (moved && G.maxScroll > 0) return;
+    var k = W / P.size().sw, lx = x * k, ly = y * k, scr = (G.screen === 'status' || G.screen === 'gallery' || G.screen === 'ending') ? 0 : 0;
+    for (var i = btns.length - 1; i >= 0; i--) { var b = btns[i]; if (lx >= b.x && lx <= b.x + b.w && ly >= b.y && ly <= b.y + b.h) { if (G.screen !== 'dialog') Audio2.sfx('tap', 0.5); b.fn(); return; } }
+  });
+P.onWheel = function (dy) { G.scroll = Math.max(0, Math.min(G.maxScroll, G.scroll + dy)); };
+G.maxScroll = 0;
+// 调试/自动化测试钩子
+(function () {
+  var q = P.launchQuery();
+  if (q && q.e && D.ENDS[q.e]) setTimeout(function () { toast('好友走到了「' + D.ENDS[q.e].name + '」——轮到你了', '#a04a66'); }, 900);
+})();
+setTimeout(function () { try { defaultShareImg = P.canvasToFile(titleCard()); } catch (e) {} }, 1500);
+function titleCard() {
+  var c = P.createCanvas(1000, 800), saved = ctx; ctx = c.getContext('2d');
+  ctx.drawImage(Scenery.get('title', W, H), 0, 0, W, W * 0.8, 0, 0, 1000, 800);
+  var im = Portrait.get('me', 'n'), Q = Portrait.Q; softPortrait(im, 40 * Q, 20 * Q, 560 * Q, 700 * Q, 460, 40, 560, 700);
+  ctx.fillStyle = U.lin(ctx, 0, 560, 0, 800, [0, 'rgba(251,245,234,0)', 1, 'rgba(251,245,234,.95)']); ctx.fillRect(0, 560, 1000, 240);
+  titleArt(200, 170, 150);
+  text('入宫一步，生死由己', 500, 740, 40, '#6a4a4e', 'center', true);
+  ctx = saved; return c;
+}
+var hook = { Audio: Audio2, endingCard: endingCard, titleCard: titleCard, watchAd: watchAd, G: G, R: R, C: C, D: D, get S() { return S; }, set S(v) { S = v; }, meta: meta, run: run, step: step, choose: choose, visit: visit, tapDialog: tapDialog, newState: newState, afterEvent: afterEvent, btns: function () { return btns; } };
+if (typeof window !== 'undefined') window.__game = hook;
+if (typeof globalThis !== 'undefined' && globalThis.__TEST__) globalThis.__game = hook;
+render();
+
+});
+__d("./js/platform",function(require,module,exports){
+// 平台适配层：微信小游戏 / 抖音小游戏 / 浏览器 共用一套代码
+var isWx = typeof wx !== 'undefined' && !!wx.createCanvas;
+var isTt = !isWx && typeof tt !== 'undefined' && !!tt.createCanvas;
+var api = isWx ? wx : (isTt ? tt : null);
+var P = { name: isWx ? 'wx' : (isTt ? 'tt' : 'web') };
+var mainCanvas, sw, sh, dpr;
+
+if (api) {
+  mainCanvas = api.createCanvas();
+  var info = api.getSystemInfoSync();
+  sw = info.windowWidth; sh = info.windowHeight; dpr = Math.min(info.pixelRatio || 2, 3);
+  mainCanvas.width = sw * dpr; mainCanvas.height = sh * dpr;
+} else {
+  mainCanvas = document.getElementById('game');
+  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  var fit = function () {
+    var ww = window.innerWidth, wh = window.innerHeight;
+    sh = wh; sw = Math.min(ww, Math.round(wh * 0.62));
+    if (sw / sh < 0.42) sh = Math.round(sw / 0.42);
+    mainCanvas.style.width = sw + 'px'; mainCanvas.style.height = sh + 'px';
+    mainCanvas.width = sw * dpr; mainCanvas.height = sh * dpr;
+    if (P.onResize) P.onResize();
+  };
+  fit(); window.addEventListener('resize', fit);
+}
+P.canvas = mainCanvas;
+// 个别旧机型的 Canvas 缺少 ellipse / setLineDash，这里补上
+(function () {
+  var c2 = mainCanvas.getContext('2d'), pr = Object.getPrototypeOf(c2) || c2;
+  if (!c2.ellipse) pr.ellipse = function (x, y, rx, ry, rot, a0, a1, ccw) { this.save(); this.translate(x, y); this.rotate(rot || 0); this.scale(rx, ry); this.arc(0, 0, 1, a0, a1, ccw); this.restore(); };
+  if (!c2.setLineDash) pr.setLineDash = function () {};
+})();
+P.size = function () { return { sw: sw, sh: sh, dpr: dpr }; };
+P.createCanvas = function (w, h) {
+  var c = api ? api.createCanvas() : document.createElement('canvas');
+  c.width = w; c.height = h; return c;
+};
+P.createImage = function () { return api ? api.createImage() : new Image(); };
+// 触摸：回调收到屏幕坐标（CSS 像素）
+P.onTouch = function (start, move, end) {
+  if (api) {
+    api.onTouchStart(function (e) { var t = e.touches[0]; if (t) start(t.clientX, t.clientY); });
+    api.onTouchMove(function (e) { var t = e.touches[0]; if (t) move(t.clientX, t.clientY); });
+    api.onTouchEnd(function (e) { var t = e.changedTouches[0]; if (t) end(t.clientX, t.clientY); });
+  } else {
+    var down = false;
+    var pos = function (e) { var r = mainCanvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+    mainCanvas.addEventListener('pointerdown', function (e) { down = true; var p = pos(e); start(p[0], p[1]); });
+    mainCanvas.addEventListener('pointermove', function (e) { if (down) { var p = pos(e); move(p[0], p[1]); } });
+    window.addEventListener('pointerup', function (e) { if (down) { down = false; var p = pos(e); end(p[0], p[1]); } });
+    mainCanvas.addEventListener('wheel', function (e) { if (P.onWheel) P.onWheel(e.deltaY); e.preventDefault(); }, { passive: false });
+  }
+};
+// 音频
+P.audioBase = api ? 'audio/' : ((typeof window !== 'undefined' && window.__AUDIO_BASE__) || 'audio/');
+P.createAudio = function () {
+  if (!api) return new Audio();
+  var a = api.createInnerAudioContext();
+  return a;
+};
+if (api && api.setInnerAudioOption) { try { api.setInnerAudioOption({ obeyMuteSwitch: true, mixWithOther: true }); } catch (e) {} }
+P.onHideShow = function (hide, show) {
+  if (api) { if (api.onHide) api.onHide(hide); if (api.onShow) api.onShow(show); }
+  else document.addEventListener('visibilitychange', function () { if (document.hidden) hide(); else show(); });
+};
+// ───── 广告 ─────
+var cfg = require('./config');
+P.cfg = cfg;
+var adIds = api ? (cfg[P.name] || {}) : {};
+var rv = null, rvCb = null, itAd = null, lastIt = Date.now();
+function rvDone(ok, msg) { var cb = rvCb; rvCb = null; if (!cb) return; if (ok) cb.ok(); else cb.fail(msg); }
+// 返回 'real' 表示调起了平台广告；返回 'mock' 表示需要游戏自己放示意广告；返回 'none' 表示不可用
+P.showRewarded = function (onReward, onFail) {
+  if (!api || !adIds.rewarded) return cfg.mockAdsWhenUnset ? 'mock' : 'none';
+  try {
+    if (!rv) {
+      rv = api.createRewardedVideoAd({ adUnitId: adIds.rewarded });
+      rv.onClose(function (res) { if (!res || res.isEnded) rvDone(true); else rvDone(false, '完整看完才能领取哦'); });
+      rv.onError(function () { rvDone(false, '暂时没有可播放的广告，稍后再试'); });
+    }
+    rvCb = { ok: onReward, fail: onFail };
+    rv.show().catch(function () { return rv.load().then(function () { return rv.show(); }); })
+      .catch(function () { rvDone(false, '广告加载失败，稍后再试'); });
+    return 'real';
+  } catch (e) { rvCb = null; return 'none'; }
+};
+P.showInterstitial = function () {
+  if (!api || !adIds.interstitial) return;
+  var now = Date.now(); if (now - lastIt < (cfg.interstitialGapSec || 120) * 1000) return; lastIt = now;
+  try {
+    if (!itAd) { itAd = api.createInterstitialAd({ adUnitId: adIds.interstitial }); itAd.onError(function () {}); }
+    itAd.show().catch(function () {});
+  } catch (e) {}
+};
+// ───── 分享 ─────
+P.canShare = !!api;
+P.share = function (o) {
+  if (!api) return false;
+  try { api.shareAppMessage({ title: o.title, imageUrl: o.imageUrl || '', query: o.query || '' }); return true; } catch (e) { return false; }
+};
+P.setDefaultShare = function (fn) {
+  if (!api) return;
+  try { if (api.showShareMenu) api.showShareMenu({ withShareTicket: false, menus: ['shareAppMessage', 'shareTimeline'] }); } catch (e) {}
+  try { if (api.onShareAppMessage) api.onShareAppMessage(function () { return fn(); }); } catch (e) {}
+  try { if (isWx && wx.onShareTimeline) wx.onShareTimeline(function () { var o = fn(); return { title: o.title, imageUrl: o.imageUrl, query: o.query }; }); } catch (e) {}
+};
+P.canvasToFile = function (c) {
+  try { return c.toTempFilePathSync({ x: 0, y: 0, width: c.width, height: c.height, destWidth: c.width, destHeight: c.height, fileType: 'png' }); } catch (e) { return ''; }
+};
+P.saveImage = function (c, ok, fail) {
+  if (!api) {
+    fail('网页版不能直接存进相册');
+    return;
+  }
+  var p = P.canvasToFile(c); if (!p) { fail('生成图片失败'); return; }
+  api.saveImageToPhotosAlbum({ filePath: p, success: ok, fail: function (e) { fail(/auth|deny/i.test((e && e.errMsg) || '') ? '需要允许保存到相册' : '保存失败'); } });
+};
+P.launchQuery = function () { try { return api ? (api.getLaunchOptionsSync().query || {}) : {}; } catch (e) { return {}; } };
+// ───── 抖音录屏（把游戏过程录成视频直接发抖音）─────
+P.canRecord = isTt && !!tt.getGameRecorderManager;
+var rec = null;
+P.rec = { on: false, t0: 0, cb: null };
+P.recStart = function (onStop) {
+  if (!P.canRecord) return;
+  if (!rec) {
+    rec = tt.getGameRecorderManager();
+    rec.onStop(function (res) { P.rec.on = false; var cb = P.rec.cb; P.rec.cb = null; if (cb) cb(res.videoPath, Date.now() - P.rec.t0); });
+    if (rec.onError) rec.onError(function () { P.rec.on = false; });
+  }
+  P.rec.cb = onStop; P.rec.t0 = Date.now(); P.rec.on = true;
+  rec.start({ duration: 300 });
+};
+P.recStop = function () { if (rec && P.rec.on) rec.stop(); };
+P.shareVideo = function (path, title, fail) {
+  tt.shareAppMessage({ channel: 'video', title: title, extra: { videoPath: path, videoTopics: ['后宫传', '宫斗'], hashtag_list: ['后宫传', '宫斗'] }, fail: function () { if (fail) fail(); } });
+};
+var mem = {};
+P.load = function (key) {
+  try {
+    var v = api ? api.getStorageSync(key) : window.localStorage.getItem(key);
+    if (v) return JSON.parse(v);
+  } catch (e) {}
+  return mem[key] ? JSON.parse(mem[key]) : null;
+};
+P.save = function (key, obj) {
+  var v = JSON.stringify(obj); mem[key] = v;
+  try { if (api) api.setStorageSync(key, v); else window.localStorage.setItem(key, v); } catch (e) {}
+};
+P.raf = function (fn) {
+  if (typeof requestAnimationFrame !== 'undefined') return requestAnimationFrame(fn);
+  return setTimeout(fn, 16);
+};
+P.FONT = '"Noto Serif SC","Songti SC","STSong","Source Han Serif SC","SimSun",serif';
+module.exports = P;
+
+});
+__d("./js/portrait",function(require,module,exports){
+// 人物立绘：全部用 Canvas 路径程序化绘制（古风水彩感），首次绘制后缓存为离屏画布。
+// 若日后有正式美术图，可在 images/portraits/<id>.png 放同名文件并在 CHARS 里加 img 字段替换。
+var P = require('./platform');
+
+var PW = 640, PH = 940, CX = 320, CY = 300;
+
+function path(ctx, d) {
+  var t = d.match(/[MLCQZ]|-?\d+(\.\d+)?/g), i = 0;
+  ctx.beginPath();
+  while (i < t.length) {
+    var c = t[i++];
+    if (c === 'M') { ctx.moveTo(+t[i], +t[i + 1]); i += 2; }
+    else if (c === 'L') { ctx.lineTo(+t[i], +t[i + 1]); i += 2; }
+    else if (c === 'C') { ctx.bezierCurveTo(+t[i], +t[i + 1], +t[i + 2], +t[i + 3], +t[i + 4], +t[i + 5]); i += 6; }
+    else if (c === 'Q') { ctx.quadraticCurveTo(+t[i], +t[i + 1], +t[i + 2], +t[i + 3]); i += 4; }
+    else if (c === 'Z') ctx.closePath();
+  }
+}
+function hex(h) { return [parseInt(h.substr(1, 2), 16), parseInt(h.substr(3, 2), 16), parseInt(h.substr(5, 2), 16)]; }
+function rgba(h, a) { var c = hex(h); return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+function mix(h1, h2, t) {
+  var a = hex(h1), b = hex(h2), r = [];
+  for (var i = 0; i < 3; i++) r.push(Math.round(a[i] + (b[i] - a[i]) * t));
+  return '#' + r.map(function (v) { return (v < 16 ? '0' : '') + v.toString(16); }).join('');
+}
+function lighten(h, t) { return mix(h, '#ffffff', t); }
+function darken(h, t) { return mix(h, '#1a1014', t); }
+function lin(ctx, x0, y0, x1, y1, stops) {
+  var g = ctx.createLinearGradient(x0, y0, x1, y1);
+  for (var i = 0; i < stops.length; i += 2) g.addColorStop(stops[i], stops[i + 1]);
+  return g;
+}
+function rad(ctx, x, y, r, stops) {
+  var g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  for (var i = 0; i < stops.length; i += 2) g.addColorStop(stops[i], stops[i + 1]);
+  return g;
+}
+function seeded(n) { var s = n; return function () { s = (s * 9301 + 49297) % 233280; return s / 233280; }; }
+
+// ───────── 角色造型定义 ─────────
+var SKIN = '#fbeee4';
+var CHARS = {
+  me:  { name: '', robe: '#bfe6d8', dress: '#8fd0be', trim: '#3f9c8a', sash: '#f0c15a', inner: '#fffaf2', hair: '#2a1f22', bun: 'side', back: 'long', style: 'open', dian: '#d8504a', gold: 2, eye: { tilt: 3, open: 1 }, lip: '#d9606a', tilt: -0.04, aura: '#bfe9dc' },
+  wt:  { name: '林晚棠', robe: '#fbd9d6', dress: '#f6b3ae', trim: '#e07f86', sash: '#fff1c9', inner: '#fffaf5', hair: '#33232a', bun: 'double', back: 'long', style: 'open', dian: null, gold: 1, eye: { tilt: 1, open: 1.12 }, lip: '#e27580', tilt: 0.05, aura: '#fbdcdc', flower: '#f39aa8' },
+  wt2: { name: '林晚棠', robe: '#8e2f4a', dress: '#5f1f38', trim: '#e6c06a', sash: '#e6c06a', inner: '#f6e9df', hair: '#221a1f', bun: 'high', back: 'none', style: 'open', dian: '#c93545', gold: 3, eye: { tilt: 4, open: 0.9 }, lip: '#b8263c', tilt: 0.03, aura: '#c58a9c', shadow: '#a04a66' },
+  gf:  { name: '顾明珠', robe: '#d8434a', dress: '#a8242f', trim: '#f2cf72', sash: '#f2cf72', inner: '#fff3e6', hair: '#1e1518', bun: 'cloud', back: 'none', style: 'open', dian: '#c9202c', gold: 4, eye: { tilt: 6, open: 0.92 }, lip: '#c4202f', tilt: -0.05, aura: '#f3b7a6', shadow: '#d0564f' },
+  gf2: { name: '顾明珠', robe: '#f3f1ee', dress: '#e4e1dd', trim: '#cfcac4', sash: '#d9d5cf', inner: '#ffffff', hair: '#1e1518', bun: 'none', back: 'loose', style: 'closed', dian: null, gold: 0, eye: { tilt: 6, open: 0.9 }, lip: '#c98088', tilt: -0.03, aura: '#e3e6ee', plain: 1 },
+  hh:  { name: '沈令仪', robe: '#27506b', dress: '#1d3d55', trim: '#f0cf78', sash: '#c23a3a', inner: '#fdf6e8', hair: '#1c171b', bun: 'phoenix', back: 'none', style: 'closed', dian: '#c9a23a', gold: 4, eye: { tilt: 2, open: 0.88 }, lip: '#b84a52', tilt: 0, aura: '#b9cfe0' },
+  th:  { name: '太后', robe: '#3c2748', dress: '#2a1b34', trim: '#d9b65e', sash: '#7a1f2c', inner: '#efe6d8', hair: '#3b3539', bun: 'low', back: 'none', style: 'closed', dian: null, gold: 3, eye: { tilt: 2, open: 0.72 }, lip: '#8e3a44', tilt: 0, aura: '#c9b9d6', old: 1 },
+  hd:  { name: '萧景珩', robe: '#1f1c26', dress: '#1f1c26', trim: '#e2bf62', sash: '#8c1c22', inner: '#f7f1e6', hair: '#17141a', bun: 'guan', back: 'none', style: 'closed', male: 1, gold: 0, eye: { tilt: 3, open: 0.8 }, lip: '#b98078', tilt: 0.02, aura: '#e9d9a8', dragon: 1 },
+  sy:  { name: '苏砚', robe: '#eef3f6', dress: '#dfe9ef', trim: '#8fb0c6', sash: '#6f93ab', inner: '#ffffff', hair: '#231d22', bun: 'ribbon', back: 'long', style: 'closed', male: 1, soft: 1, gold: 0, eye: { tilt: 1, open: 0.9 }, lip: '#c99088', tilt: -0.04, aura: '#d6e6ee' },
+  ar:  { name: '阿箬', robe: '#c9d9e6', dress: '#a9c0d4', trim: '#6f8fae', sash: '#f4e6b8', inner: '#fbfbf8', hair: '#2e2326', bun: 'double', back: 'none', style: 'closed', gold: 0, bangs: 1, eye: { tilt: 0, open: 1.2 }, lip: '#e0848a', tilt: 0.06, aura: '#d8e4ee', young: 1 },
+  rg:  { name: '容姑姑', robe: '#3f5a4c', dress: '#31483c', trim: '#b9a36a', sash: '#2a3a31', inner: '#f3ecdf', hair: '#2a2426', bun: 'low', back: 'none', style: 'closed', gold: 1, eye: { tilt: 1, open: 0.8 }, lip: '#a55a5a', tilt: 0, aura: '#c6d3c4', mid: 1 },
+  ys:  { name: '云氏', robe: '#c9c8c6', dress: '#b3b2b1', trim: '#9a9896', sash: '#8c8a88', inner: '#e9e6e1', hair: '#4a4448', bun: 'none', back: 'loose', style: 'closed', gold: 0, eye: { tilt: 2, open: 0.85 }, lip: '#b98a8a', tilt: 0.05, aura: '#cfd3dc', mid: 1, plain: 1, gaunt: 1 }
+};
+
+// ───────── 发饰小件 ─────────
+function goldFlower(ctx, x, y, r, core) {
+  ctx.save(); ctx.translate(x, y);
+  for (var i = 0; i < 6; i++) {
+    ctx.rotate(Math.PI / 3);
+    ctx.beginPath(); ctx.ellipse(0, -r * 0.62, r * 0.36, r * 0.6, 0, 0, 6.3);
+    ctx.fillStyle = lin(ctx, 0, -r, 0, 0, [0, '#fff3b8', 1, '#d9a235']); ctx.fill();
+    ctx.strokeStyle = 'rgba(140,90,20,.45)'; ctx.lineWidth = 0.8; ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.3, 0, 6.3); ctx.fillStyle = core || '#c8323c'; ctx.fill();
+  ctx.beginPath(); ctx.arc(-r * 0.08, -r * 0.08, r * 0.1, 0, 6.3); ctx.fillStyle = 'rgba(255,255,255,.8)'; ctx.fill();
+  ctx.restore();
+}
+function tassel(ctx, x, y, len, col) {
+  ctx.strokeStyle = '#d9a235'; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + len * 0.45); ctx.stroke();
+  ctx.beginPath(); ctx.arc(x, y + len * 0.5, 3.2, 0, 6.3); ctx.fillStyle = col || '#7fd0c0'; ctx.fill();
+  ctx.strokeStyle = '#e6b84a'; ctx.lineWidth = 1;
+  for (var i = -1; i <= 1; i++) { ctx.beginPath(); ctx.moveTo(x, y + len * 0.55); ctx.lineTo(x + i * 2.4, y + len); ctx.stroke(); }
+}
+function pin(ctx, x1, y1, x2, y2) {
+  ctx.strokeStyle = '#b8862a'; ctx.lineWidth = 4.2; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.strokeStyle = '#ffe9a0'; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(x1, y1 - 1); ctx.lineTo(x2, y2 - 1); ctx.stroke();
+}
+function hairFill(ctx, d, x0, y0, x1, y1) {
+  return lin(ctx, x0, y0, x1, y1, [0, lighten(d.hair, 0.16), 0.5, d.hair, 1, darken(d.hair, 0.35)]);
+}
+function strands(ctx, d, list) {
+  ctx.strokeStyle = rgba(lighten(d.hair, 0.45), 0.35); ctx.lineWidth = 1.1; ctx.lineCap = 'round';
+  for (var i = 0; i < list.length; i++) { path(ctx, list[i]); ctx.stroke(); }
+}
+
+// ───────── 后发 / 发髻 ─────────
+function backHair(ctx, d) {
+  if (d.back === 'long' || d.back === 'loose') {
+    var w = d.back === 'loose' ? 14 : 0;
+    path(ctx, 'M -88,-70 C -108,40 -118,180 -' + (150 + w) + ',430 C -110,500 -60,470 -40,430 L 40,430 C 60,470 110,500 ' + (150 + w) + ',430 C 118,180 108,40 88,-70 C 86,-150 -86,-150 -88,-70 Z');
+    ctx.fillStyle = hairFill(ctx, d, 0, -120, 0, 460); ctx.fill();
+    strands(ctx, d, ['M -96,20 C -112,160 -120,300 -138,420', 'M -80,60 C -92,200 -98,320 -104,440', 'M 96,20 C 112,160 120,300 138,420', 'M 80,60 C 92,200 98,320 104,440']);
+  }
+}
+function bun(ctx, d) {
+  var b = d.bun, g = hairFill(ctx, d, 0, -250, 0, -90);
+  ctx.fillStyle = g;
+  function blob(x, y, rx, ry, rot) {
+    ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot || 0, 0, 6.3); ctx.fillStyle = hairFill(ctx, d, x - rx, y - ry, x + rx * 0.6, y + ry); ctx.fill();
+    ctx.strokeStyle = rgba(lighten(d.hair, 0.5), 0.3); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.ellipse(x - rx * 0.1, y - ry * 0.1, rx * 0.68, ry * 0.66, rot || 0, 3.4, 5.6); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(x - rx * 0.05, y - ry * 0.05, rx * 0.4, ry * 0.4, rot || 0, 3.3, 5.4); ctx.stroke();
+  }
+  function loop(x, y, rx, ry, rot, lw) {
+    ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, 6.3);
+    ctx.strokeStyle = d.hair; ctx.lineWidth = lw || 15; ctx.stroke();
+    ctx.strokeStyle = rgba(lighten(d.hair, 0.5), 0.28); ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.ellipse(x, y, rx + 3, ry + 3, rot, 3.6, 5.4); ctx.stroke();
+  }
+  if (b === 'side') { blob(34, -150, 42, 34, -0.3); loop(62, -182, 22, 30, 0.5, 13); blob(-26, -146, 30, 22, 0.3); }
+  else if (b === 'double') { blob(-54, -140, 34, 32, 0.2); blob(54, -140, 34, 32, -0.2); }
+  else if (b === 'high') { blob(0, -168, 52, 44); blob(-48, -140, 26, 20, 0.5); blob(48, -140, 26, 20, -0.5); }
+  else if (b === 'cloud') { loop(-50, -190, 26, 40, -0.35, 16); loop(50, -190, 26, 40, 0.35, 16); blob(0, -176, 50, 50); blob(-58, -128, 30, 22, 0.6); blob(58, -128, 30, 22, -0.6); }
+  else if (b === 'phoenix') { blob(0, -170, 58, 46); blob(-62, -124, 30, 26, 0.5); blob(62, -124, 30, 26, -0.5); }
+  else if (b === 'low') { blob(0, -150, 70, 30); blob(-66, -108, 24, 28, 0.3); blob(66, -108, 24, 28, -0.3); }
+  else if (b === 'guan') { blob(0, -152, 30, 26); }
+  else if (b === 'ribbon') { blob(0, -148, 28, 22); }
+}
+
+// ───────── 身体与衣饰 ─────────
+function body(ctx, d) {
+  var SW = d.male ? 168 : 128, skin = SKIN;
+  // 颈
+  path(ctx, 'M -25,66 L -28,132 C -12,150 12,150 28,132 L 25,66 Z');
+  ctx.fillStyle = lin(ctx, 0, 70, 0, 140, [0, darken(skin, 0.16), 0.5, skin, 1, skin]); ctx.fill();
+  // 外袍轮廓
+  var sil = 'M -36,124 C -74,134 -' + (SW - 12) + ',148 -' + SW + ',190 C -' + (SW + 26) + ',300 -' + (SW + 56) + ',470 -' + (SW + 78) + ',640 L ' + (SW + 78) + ',640 C ' + (SW + 56) + ',470 ' + (SW + 26) + ',300 ' + SW + ',190 C ' + (SW - 12) + ',148 74,134 36,124 C 14,150 -14,150 -36,124 Z';
+  path(ctx, sil);
+  ctx.fillStyle = lin(ctx, 0, 120, 0, 640, [0, lighten(d.robe, 0.22), 0.45, d.robe, 1, darken(d.robe, 0.22)]); ctx.fill();
+  ctx.strokeStyle = rgba(darken(d.robe, 0.55), 0.3); ctx.lineWidth = 1.4; ctx.stroke();
+  ctx.save(); path(ctx, sil); ctx.clip();
+  // 袖口光晕与暗花
+  ctx.fillStyle = rad(ctx, -SW - 20, 420, 190, [0, rgba(lighten(d.robe, 0.5), 0.55), 1, rgba(d.robe, 0)]); ctx.fillRect(-320, 150, 640, 500);
+  ctx.fillStyle = rad(ctx, SW + 20, 420, 190, [0, rgba(lighten(d.robe, 0.5), 0.55), 1, rgba(d.robe, 0)]); ctx.fillRect(-320, 150, 640, 500);
+  if (!d.plain) {
+    var rnd = seeded(d.robe.charCodeAt(2) * 7 + 3);
+    for (var i = 0; i < 26; i++) {
+      var fx = (rnd() - 0.5) * (SW * 2 + 120), fy = 190 + rnd() * 440, fr = 5 + rnd() * 5;
+      if (Math.abs(fx) < 70) continue;
+      ctx.save(); ctx.translate(fx, fy); ctx.rotate(rnd() * 6);
+      ctx.fillStyle = rgba(d.dragon ? '#e2bf62' : lighten(d.robe, 0.7), d.dragon ? 0.28 : 0.4);
+      for (var k = 0; k < 5; k++) { ctx.rotate(1.2566); ctx.beginPath(); ctx.ellipse(0, -fr * 0.7, fr * 0.36, fr * 0.6, 0, 0, 6.3); ctx.fill(); }
+      ctx.restore();
+    }
+  }
+  // 衣褶
+  ctx.strokeStyle = rgba(darken(d.robe, 0.5), 0.2); ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+  var folds = ['M -' + (SW - 30) + ',210 C -' + (SW - 12) + ',330 -' + (SW - 4) + ',480 -' + (SW + 6) + ',640', 'M -' + (SW + 6) + ',240 C -' + (SW + 22) + ',360 -' + (SW + 34) + ',500 -' + (SW + 44) + ',640', 'M -' + (SW - 56) + ',300 C -' + (SW - 50) + ',420 -' + (SW - 46) + ',540 -' + (SW - 44) + ',640'];
+  for (var f = 0; f < folds.length; f++) { path(ctx, folds[f]); ctx.stroke(); ctx.save(); ctx.scale(-1, 1); path(ctx, folds[f]); ctx.stroke(); ctx.restore(); }
+  ctx.restore();
+
+  if (d.style === 'open') {
+    // 对襟大袖衫敞开，内着齐胸襦裙
+    var open = 'M -34,124 C -52,200 -60,320 -70,640 L 70,640 C 60,320 52,200 34,124 C 14,150 -14,150 -34,124 Z';
+    path(ctx, open); ctx.fillStyle = d.inner; ctx.fill();
+    ctx.save(); path(ctx, open); ctx.clip();
+    // 颈下肌肤
+    path(ctx, 'M -30,124 C -14,150 14,150 30,124 L 10,176 L 0,186 L -10,176 Z'); ctx.fillStyle = skin; ctx.fill();
+    // 中衣交领
+    ctx.lineWidth = 9; ctx.strokeStyle = lighten(d.trim, 0.55);
+    path(ctx, 'M -32,128 L 16,214'); ctx.stroke();
+    path(ctx, 'M 32,128 L -30,222'); ctx.stroke();
+    ctx.lineWidth = 1; ctx.strokeStyle = rgba(d.trim, 0.6);
+    path(ctx, 'M 27,126 L -34,218'); ctx.stroke();
+    // 裙身
+    ctx.fillStyle = lin(ctx, 0, 250, 0, 640, [0, lighten(d.dress, 0.12), 1, darken(d.dress, 0.18)]); ctx.fillRect(-80, 250, 160, 400);
+    ctx.strokeStyle = rgba(darken(d.dress, 0.5), 0.2); ctx.lineWidth = 1.3;
+    for (var p = -3; p <= 3; p++) { path(ctx, 'M ' + (p * 14) + ',262 L ' + (p * 19) + ',640'); ctx.stroke(); }
+    // 齐胸束带
+    ctx.fillStyle = lin(ctx, 0, 214, 0, 258, [0, lighten(d.trim, 0.15), 1, darken(d.trim, 0.12)]); ctx.fillRect(-80, 214, 160, 44);
+    ctx.strokeStyle = rgba('#fff6d0', 0.8); ctx.lineWidth = 1.2; ctx.setLineDash([2, 5]);
+    path(ctx, 'M -80,222 L 80,222'); ctx.stroke(); path(ctx, 'M -80,250 L 80,250'); ctx.stroke(); ctx.setLineDash([]);
+    for (var q = -2; q <= 2; q++) goldFlower(ctx, q * 24, 236, 7, lighten(d.trim, 0.6));
+    ctx.restore();
+    // 系带
+    ctx.fillStyle = d.sash;
+    path(ctx, 'M -4,256 C -20,320 -26,400 -18,520 L -6,520 C -10,400 -4,320 4,258 Z'); ctx.fill();
+    path(ctx, 'M 4,256 C 22,330 28,420 30,500 L 18,502 C 16,420 10,330 -2,260 Z'); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(-14, 258, 15, 8, -0.3, 0, 6.3); ctx.fill(); ctx.beginPath(); ctx.ellipse(14, 258, 15, 8, 0.3, 0, 6.3); ctx.fill();
+    ctx.beginPath(); ctx.arc(0, 258, 5.5, 0, 6.3); ctx.fillStyle = darken(d.sash, 0.2); ctx.fill();
+    // 衣缘
+    ctx.lineWidth = 15; ctx.lineCap = 'butt'; ctx.strokeStyle = lin(ctx, 0, 120, 0, 640, [0, lighten(d.trim, 0.1), 1, darken(d.trim, 0.1)]);
+    path(ctx, 'M -38,122 C -58,200 -66,320 -76,640'); ctx.stroke(); path(ctx, 'M 38,122 C 58,200 66,320 76,640'); ctx.stroke();
+    ctx.lineWidth = 1.2; ctx.strokeStyle = rgba('#fff8dc', 0.75); ctx.setLineDash([3, 6]);
+    path(ctx, 'M -38,126 C -58,200 -66,320 -76,640'); ctx.stroke(); path(ctx, 'M 38,126 C 58,200 66,320 76,640'); ctx.stroke(); ctx.setLineDash([]);
+    // 披帛
+    ctx.fillStyle = rgba(lighten(d.robe, 0.75), 0.42);
+    path(ctx, 'M -' + (SW - 8) + ',170 C -' + (SW + 30) + ',260 -' + (SW - 20) + ',380 -' + (SW - 70) + ',470 C -' + (SW - 40) + ',480 -' + (SW + 10) + ',400 -' + (SW + 46) + ',300 C -' + (SW + 50) + ',240 -' + (SW + 20) + ',190 -' + (SW - 8) + ',170 Z'); ctx.fill();
+    ctx.save(); ctx.scale(-1, 1);
+    path(ctx, 'M -' + (SW - 8) + ',170 C -' + (SW + 30) + ',260 -' + (SW - 20) + ',380 -' + (SW - 70) + ',470 C -' + (SW - 40) + ',480 -' + (SW + 10) + ',400 -' + (SW + 46) + ',300 C -' + (SW + 50) + ',240 -' + (SW + 20) + ',190 -' + (SW - 8) + ',170 Z'); ctx.fill();
+    ctx.restore();
+  } else {
+    // 交领右衽
+    path(ctx, 'M -30,124 C -14,150 14,150 30,124 L 6,170 L -4,176 Z'); ctx.fillStyle = skin; ctx.fill();
+    ctx.lineCap = 'butt';
+    ctx.lineWidth = 12; ctx.strokeStyle = d.inner; path(ctx, 'M -34,122 L 6,196'); ctx.stroke(); path(ctx, 'M 34,122 L -14,196'); ctx.stroke();
+    var tw = d.male ? 26 : 22;
+    ctx.lineWidth = tw; ctx.strokeStyle = lin(ctx, 0, 120, 0, 340, [0, lighten(d.trim, 0.12), 1, darken(d.trim, 0.14)]);
+    path(ctx, 'M -46,124 L 14,246'); ctx.stroke();
+    path(ctx, 'M 46,124 C 20,190 -40,270 -' + (SW - 60) + ',334'); ctx.stroke();
+    if (!d.plain) {
+      ctx.lineWidth = 1.3; ctx.strokeStyle = rgba(d.dragon ? '#7a1418' : '#fff8dc', 0.7); ctx.setLineDash([3, 6]);
+      path(ctx, 'M 46,124 C 20,190 -40,270 -' + (SW - 60) + ',334'); ctx.stroke(); ctx.setLineDash([]);
+    }
+    // 腰带
+    var bw = SW - 34;
+    ctx.fillStyle = lin(ctx, 0, 330, 0, 366, [0, lighten(d.sash, 0.15), 1, darken(d.sash, 0.2)]); ctx.fillRect(-bw, 330, bw * 2, 36);
+    if (!d.plain) {
+      ctx.fillStyle = d.male ? '#e9f0e4' : lighten(d.trim, 0.3);
+      ctx.fillRect(-20, 334, 40, 28); ctx.strokeStyle = rgba('#8a6a20', 0.6); ctx.lineWidth = 1.5; ctx.strokeRect(-20, 334, 40, 28);
+      if (d.dragon) { goldFlower(ctx, -64, 348, 9, '#8c1c22'); goldFlower(ctx, 64, 348, 9, '#8c1c22'); }
+    }
+    // 双袖拢于身前
+    var A = SW, sl = 'M -' + A + ',196 C -' + (A + 34) + ',300 -' + (A + 30) + ',430 -' + (A - 24) + ',478 C -96,522 -30,506 16,446 C -16,410 -64,388 -' + (A - 52) + ',310 Z';
+    var dr = 'M -' + (A - 24) + ',478 C -' + (A + 4) + ',560 -' + (A - 30) + ',640 -60,640 L 36,640 C 30,560 22,500 16,446 C -30,506 -96,522 -' + (A - 24) + ',478 Z';
+    for (var sd = 1; sd >= -1; sd -= 2) {
+      ctx.save(); ctx.scale(sd, 1);
+      path(ctx, dr); ctx.fillStyle = lin(ctx, 0, 450, 0, 640, [0, d.robe, 1, darken(d.robe, 0.25)]); ctx.fill();
+      path(ctx, sl); ctx.fillStyle = lin(ctx, -A, 200, 0, 480, [0, lighten(d.robe, 0.2), 1, darken(d.robe, 0.06)]); ctx.fill();
+      ctx.strokeStyle = rgba(darken(d.robe, 0.6), 0.3); ctx.lineWidth = 1.4; ctx.stroke();
+      ctx.lineWidth = 1.2; path(ctx, 'M -' + (A - 10) + ',300 C -' + (A - 30) + ',400 -80,450 -20,470'); ctx.stroke();
+      path(ctx, 'M -' + (A + 6) + ',330 C -' + (A - 10) + ',430 -90,480 -40,492'); ctx.stroke();
+      ctx.lineWidth = 9; ctx.strokeStyle = rgba(d.trim, 0.9); path(ctx, 'M 16,446 C 22,500 30,560 36,640'); ctx.stroke();
+      ctx.restore();
+    }
+    if (d.dragon) {
+      // 肩头团纹
+      ctx.strokeStyle = rgba('#e2bf62', 0.85); ctx.lineWidth = 2;
+      for (var s = -1; s <= 1; s += 2) {
+        ctx.beginPath(); ctx.arc(s * 108, 214, 26, 0, 6.3); ctx.stroke();
+        ctx.beginPath(); ctx.arc(s * 108, 214, 19, 0.6, 5.2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(s * 108, 214, 10, 2, 7); ctx.stroke();
+      }
+    }
+  }
+}
+
+// ───────── 面部 ─────────
+function face(ctx, d, ex) {
+  var skin = SKIN, m = d.male ? 1.07 : 1;
+  var fp = d.male && !d.soft
+    ? 'M -78,-40 C -80,14 -72,54 -46,78 C -26,96 -10,101 0,101 C 10,101 26,96 46,78 C 72,54 80,14 78,-40 C 78,-100 42,-120 0,-120 C -42,-120 -78,-100 -78,-40 Z'
+    : 'M -74,-40 C -76,10 -66,52 -40,77 C -22,93 -8,99 0,99 C 8,99 22,93 40,77 C 66,52 76,10 74,-40 C 74,-100 40,-118 0,-118 C -40,-118 -74,-100 -74,-40 Z';
+  // 耳
+  ctx.fillStyle = darken(skin, 0.06);
+  ctx.beginPath(); ctx.ellipse(-74 * m, 8, 8, 17, 0.15, 0, 6.3); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(74 * m, 8, 8, 17, -0.15, 0, 6.3); ctx.fill();
+  path(ctx, fp);
+  ctx.fillStyle = rad(ctx, -8, -10, 150, [0, lighten(skin, 0.5), 0.6, skin, 1, darken(skin, 0.1)]); ctx.fill();
+  ctx.strokeStyle = rgba('#b98a78', 0.45); ctx.lineWidth = 1.1; ctx.stroke();
+  ctx.save(); path(ctx, fp); ctx.clip();
+  // 额发投影
+  ctx.fillStyle = lin(ctx, 0, -110, 0, -30, [0, rgba('#a9806e', 0.4), 1, rgba('#a9806e', 0)]); ctx.fillRect(-90, -120, 180, 90);
+  if (!d.male) {
+    var bl = d.gaunt ? 0.1 : (d.old || d.mid ? 0.16 : 0.3);
+    ctx.fillStyle = rad(ctx, -44, 34, 30, [0, rgba('#f08a94', bl), 1, rgba('#f08a94', 0)]); ctx.fillRect(-90, 0, 90, 80);
+    ctx.fillStyle = rad(ctx, 44, 34, 30, [0, rgba('#f08a94', bl), 1, rgba('#f08a94', 0)]); ctx.fillRect(0, 0, 90, 80);
+  }
+  if (d.gaunt) { ctx.fillStyle = rgba('#8a7a80', 0.07); ctx.beginPath(); ctx.ellipse(-52, 44, 14, 26, 0.3, 0, 6.3); ctx.fill(); ctx.beginPath(); ctx.ellipse(52, 44, 14, 26, -0.3, 0, 6.3); ctx.fill(); }
+  ctx.restore();
+
+  // 眼
+  var E = d.eye, eo = E.open, tilt = E.tilt, sad = ex === 'd' || ex === 'c', ang = ex === 'a', smile = ex === 's';
+  if (sad) eo *= 0.78; if (ang) eo *= 0.8;
+  for (var sgn = -1; sgn <= 1; sgn += 2) {
+    ctx.save(); ctx.translate(sgn * 34 * m, 4); var es = d.male ? 1.06 : 1.14; ctx.scale(sgn * es, es);
+    // 此坐标系：内眼角在 -x，外眼角在 +x
+    var top = 11 * eo, ox = 19, oy = -tilt + (sad ? 3 : 0);
+    if (smile && !d.male && !d.old) {
+      // 弯月笑眼
+      ctx.strokeStyle = darken(d.hair, 0.2); ctx.lineWidth = 3; ctx.lineCap = 'round';
+      path(ctx, 'M -17,3 Q 1,' + (-10) + ' ' + ox + ',' + (oy + 2)); ctx.stroke();
+      ctx.lineWidth = 1.6; path(ctx, 'M ' + ox + ',' + (oy + 2) + ' L ' + (ox + 6) + ',' + (oy - 2)); ctx.stroke();
+    } else {
+      var eyeP = 'M -17,3 C -10,' + (-top) + ' 7,' + (-top - 1) + ' ' + ox + ',' + oy + ' C 9,' + (6 * eo + 1) + ' -8,' + (7 * eo) + ' -17,3 Z';
+      path(ctx, eyeP); ctx.fillStyle = '#fdf9f6'; ctx.fill();
+      ctx.save(); path(ctx, eyeP); ctx.clip();
+      var ir = 9.2;
+      ctx.beginPath(); ctx.arc(1, -1, ir, 0, 6.3);
+      ctx.fillStyle = rad(ctx, 1, 1, ir, [0, '#6b4634', 0.55, '#3a241c', 1, '#1c1210']); ctx.fill();
+      ctx.beginPath(); ctx.arc(1, -1, 4, 0, 6.3); ctx.fillStyle = '#0f0a0a'; ctx.fill();
+      ctx.fillStyle = rgba('#3a2a30', 0.28); ctx.fillRect(-20, -14, 42, 7);
+      ctx.beginPath(); ctx.arc(-2.5, -4.5, 2.5, 0, 6.3); ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.beginPath(); ctx.arc(4, 2.5, 1.2, 0, 6.3); ctx.fillStyle = 'rgba(255,255,255,.7)'; ctx.fill();
+      ctx.restore();
+      // 上眼线与眼尾
+      ctx.strokeStyle = darken(d.hair, 0.25); ctx.lineCap = 'round'; ctx.lineWidth = d.male ? 2.4 : 3;
+      path(ctx, 'M -17,3 C -10,' + (-top) + ' 7,' + (-top - 1) + ' ' + ox + ',' + oy); ctx.stroke();
+      if (!d.male) { ctx.lineWidth = 1.8; path(ctx, 'M ' + ox + ',' + oy + ' L ' + (ox + 7) + ',' + (oy - 4)); ctx.stroke(); }
+      ctx.strokeStyle = rgba('#7a4a44', 0.35); ctx.lineWidth = 1;
+      path(ctx, 'M -15,' + (-top + 3) + ' C -6,' + (-top - 6) + ' 8,' + (-top - 6) + ' 18,' + (oy - 5)); ctx.stroke();
+      path(ctx, 'M -10,' + (6 * eo + 1) + ' C -2,' + (7.5 * eo + 1) + ' 8,' + (6.5 * eo + 1) + ' 15,' + (oy + 4)); ctx.stroke();
+    }
+    // 眼影
+    if (!d.male && !d.plain) { ctx.fillStyle = rad(ctx, 14, -6, 16, [0, rgba(d.shadow || '#e8909a', 0.3), 1, rgba('#e8909a', 0)]); ctx.fillRect(-6, -24, 40, 32); }
+    // 眉
+    var bi = ang ? 5 : (sad ? -5 : 0), bo = sad ? 3 : (ang ? -2 : 0); ctx.translate(0, d.male ? 3 : 5);
+    ctx.strokeStyle = rgba(d.hair, d.male ? 0.9 : 0.72); ctx.lineCap = 'round';
+    if (d.male) {
+      path(ctx, 'M -20,' + (-20 + bi) + ' L 22,' + (-28 + bo) + ' L 27,' + (-25 + bo) + ' L -19,' + (-15 + bi) + ' Z'); ctx.fillStyle = rgba(d.hair, d.soft ? 0.75 : 0.92); ctx.fill();
+    } else {
+      ctx.lineWidth = 2.6; path(ctx, 'M -18,' + (-22 + bi) + ' C -6,' + (-30 + bi * 0.4) + ' 10,' + (-31 + bo) + ' 26,' + (-24 + bo)); ctx.stroke();
+      ctx.lineWidth = 1.2; path(ctx, 'M 20,' + (-27 + bo) + ' L 30,' + (-21 + bo)); ctx.stroke();
+    }
+    if (ex === 'c') { ctx.fillStyle = 'rgba(190,225,245,.85)'; ctx.beginPath(); ctx.ellipse(8, 18, 2.6, 6, 0, 0, 6.3); ctx.fill(); }
+    ctx.restore();
+  }
+  // 鼻
+  ctx.strokeStyle = rgba('#b07a68', 0.5); ctx.lineWidth = 1.3; ctx.lineCap = 'round';
+  path(ctx, 'M -3,26 C -6,34 -6,38 0,40 C 3,41 5,40 6,38'); ctx.stroke();
+  // 唇
+  var my = 63, up = smile ? -3 : (sad ? 2.5 : (ang ? 1 : -1)), hw = smile ? 17 : 14;
+  if (d.male) hw += 2;
+  var lipc = d.lip;
+  path(ctx, 'M ' + (-hw) + ',' + (my + up) + ' C -8,' + (my - 5) + ' -3,' + (my - 6) + ' 0,' + (my - 3) + ' C 3,' + (my - 6) + ' 8,' + (my - 5) + ' ' + hw + ',' + (my + up) + ' C 7,' + (my + 2) + ' -7,' + (my + 2) + ' ' + (-hw) + ',' + (my + up) + ' Z');
+  ctx.fillStyle = darken(lipc, 0.08); ctx.fill();
+  path(ctx, 'M ' + (-hw) + ',' + (my + up) + ' C -7,' + (my + 2) + ' 7,' + (my + 2) + ' ' + hw + ',' + (my + up) + ' C 9,' + (my + 10) + ' -9,' + (my + 10) + ' ' + (-hw) + ',' + (my + up) + ' Z');
+  ctx.fillStyle = lin(ctx, 0, my, 0, my + 10, [0, lipc, 1, lighten(lipc, 0.25)]); ctx.fill();
+  ctx.strokeStyle = rgba(darken(lipc, 0.5), 0.7); ctx.lineWidth = 1.1;
+  path(ctx, 'M ' + (-hw) + ',' + (my + up) + ' C -7,' + (my + 2) + ' 7,' + (my + 2) + ' ' + hw + ',' + (my + up)); ctx.stroke();
+  if (!d.male) { ctx.fillStyle = 'rgba(255,255,255,.45)'; ctx.beginPath(); ctx.ellipse(-3, my + 5, 3.4, 1.4, 0, 0, 6.3); ctx.fill(); }
+  if (d.old) { ctx.strokeStyle = rgba('#9a7060', 0.4); ctx.lineWidth = 1.2; path(ctx, 'M -22,40 C -28,50 -27,58 -24,64'); ctx.stroke(); path(ctx, 'M 22,40 C 28,50 27,58 24,64'); ctx.stroke(); path(ctx, 'M -52,14 L -44,18'); ctx.stroke(); path(ctx, 'M 52,14 L 44,18'); ctx.stroke(); }
+  // 花钿
+  if (d.dian) {
+    ctx.fillStyle = d.dian;
+    for (var i = 0; i < 3; i++) { ctx.save(); ctx.translate(0, -50); ctx.rotate((i - 1) * 0.75); ctx.beginPath(); ctx.ellipse(0, -5, 2.4, 5.5, 0, 0, 6.3); ctx.fill(); ctx.restore(); }
+    ctx.beginPath(); ctx.arc(0, -48, 1.8, 0, 6.3); ctx.fill();
+  }
+}
+
+// ───────── 前发 ─────────
+function frontHair(ctx, d) {
+  var cap = d.male
+    ? 'M -85,0 C -94,-112 -52,-146 0,-146 C 52,-146 94,-112 85,0 C 82,-50 60,-78 30,-84 C 16,-86 6,-82 0,-74 C -6,-82 -16,-86 -30,-84 C -60,-78 -82,-50 -85,0 Z'
+    : 'M -82,10 C -92,-108 -52,-144 0,-144 C 52,-144 92,-108 82,10 C 80,-46 46,-74 0,-86 C -46,-74 -80,-46 -82,10 Z';
+  path(ctx, cap); ctx.fillStyle = hairFill(ctx, d, -60, -150, 40, 0); ctx.fill();
+  strands(ctx, d, ['M -6,-120 C -40,-110 -66,-80 -76,-30', 'M 6,-120 C 40,-110 66,-80 76,-30', 'M -4,-134 C -44,-126 -74,-96 -84,-50', 'M 4,-134 C 44,-126 74,-96 84,-50']);
+  if (d.old) { ctx.strokeStyle = 'rgba(225,222,226,.55)'; ctx.lineWidth = 2; path(ctx, 'M -10,-128 C -44,-116 -68,-90 -78,-40'); ctx.stroke(); path(ctx, 'M 14,-126 C 46,-114 70,-88 80,-36'); ctx.stroke(); path(ctx, 'M -2,-110 C -30,-104 -52,-84 -64,-52'); ctx.stroke(); }
+  if (d.bangs) {
+    path(ctx, 'M -78,-26 C -70,-110 70,-110 78,-26 C 56,-42 34,-32 0,-36 C -34,-32 -56,-42 -78,-26 Z');
+    ctx.fillStyle = d.hair; ctx.fill();
+  }
+  if (!d.male) {
+    // 鬓发
+    ctx.fillStyle = hairFill(ctx, d, -80, -20, -70, 150);
+    var lk = d.back === 'loose' ? 210 : 132;
+    path(ctx, 'M -84,-20 C -90,40 -84,90 -76,' + lk + ' C -72,90 -70,40 -72,-10 Z'); ctx.fill();
+    path(ctx, 'M 84,-20 C 90,40 84,90 76,' + lk + ' C 72,90 70,40 72,-10 Z'); ctx.fill();
+  } else if (d.soft) {
+    ctx.fillStyle = d.hair;
+    path(ctx, 'M -86,-20 C -92,30 -88,70 -82,100 C -80,70 -78,30 -78,-10 Z'); ctx.fill();
+    path(ctx, 'M 86,-20 C 92,30 88,70 82,100 C 80,70 78,30 78,-10 Z'); ctx.fill();
+  }
+}
+
+// ───────── 首饰 ─────────
+function ornaments(ctx, d) {
+  var g = d.gold, b = d.bun;
+  if (b === 'guan') {
+    ctx.fillStyle = lin(ctx, 0, -196, 0, -150, [0, '#fff0b0', 1, '#c8962e']);
+    path(ctx, 'M -22,-150 L -18,-192 C -8,-200 8,-200 18,-192 L 22,-150 Z'); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,80,20,.6)'; ctx.lineWidth = 1.2; ctx.stroke();
+    pin(ctx, -52, -168, 52, -168);
+    ctx.beginPath(); ctx.arc(0, -172, 6, 0, 6.3); ctx.fillStyle = '#b3202a'; ctx.fill();
+    return;
+  }
+  if (b === 'ribbon') {
+    ctx.fillStyle = d.trim; ctx.fillRect(-26, -150, 52, 9);
+    path(ctx, 'M 20,-146 C 60,-120 80,-60 96,10 L 86,12 C 72,-50 52,-110 16,-138 Z'); ctx.fillStyle = rgba(d.trim, 0.85); ctx.fill();
+    return;
+  }
+  if (d.flower) { goldFlower(ctx, -54, -112, 12, d.flower); goldFlower(ctx, 54, -112, 12, d.flower); tassel(ctx, -66, -100, 34, '#f6b3ae'); tassel(ctx, 66, -100, 34, '#f6b3ae'); }
+  if (d.young) { ctx.fillStyle = d.trim; ctx.fillRect(-72, -118, 36, 7); ctx.fillRect(36, -118, 36, 7); }
+  if (g >= 1 && !d.flower && !d.young) { goldFlower(ctx, b === 'low' ? 0 : 24, -112, 13, d.old || d.mid ? '#4f8f7a' : '#c8323c'); }
+  if (g >= 2) {
+    pin(ctx, 40, -150, 98, -176); goldFlower(ctx, 96, -176, 10, '#7fd0c0');
+    tassel(ctx, 52, -110, 38, '#7fd0c0'); goldFlower(ctx, -30, -118, 9);
+  }
+  if (g >= 3) {
+    pin(ctx, -40, -150, -98, -176); goldFlower(ctx, -96, -176, 10, '#c8323c');
+    tassel(ctx, -70, -104, 44, '#c8323c'); tassel(ctx, 70, -104, 44, '#c8323c');
+    goldFlower(ctx, 0, -124, 15, d.old ? '#4f8f7a' : '#c8323c');
+  }
+  if (g >= 4) {
+    // 凤冠/花冠
+    ctx.fillStyle = lin(ctx, 0, -200, 0, -120, [0, '#fff3b8', 1, '#cf9a30']);
+    path(ctx, 'M -62,-122 C -52,-160 -30,-176 0,-' + (b === 'phoenix' ? 214 : 198) + ' C 30,-176 52,-160 62,-122 C 40,-140 20,-146 0,-146 C -20,-146 -40,-140 -62,-122 Z'); ctx.fill();
+    ctx.strokeStyle = 'rgba(130,85,20,.55)'; ctx.lineWidth = 1.2; ctx.stroke();
+    goldFlower(ctx, 0, -160, 14, '#c8323c'); goldFlower(ctx, -34, -142, 9, '#7fd0c0'); goldFlower(ctx, 34, -142, 9, '#7fd0c0');
+    for (var i = -2; i <= 2; i++) { if (i) tassel(ctx, i * 22, -122, 20 - Math.abs(i) * 3, '#f5f0e6'); }
+    if (b === 'phoenix') { pin(ctx, -60, -150, -118, -150); pin(ctx, 60, -150, 118, -150); tassel(ctx, -114, -148, 70, '#c8323c'); tassel(ctx, 114, -148, 70, '#c8323c'); }
+  }
+  // 耳坠
+  if (g >= 1 && !d.male) { tassel(ctx, -75, 24, g >= 3 ? 44 : 32, d.old || d.mid ? '#4f8f7a' : (g >= 3 ? '#c8323c' : '#e6b84a')); tassel(ctx, 75, 24, g >= 3 ? 44 : 32, d.old || d.mid ? '#4f8f7a' : (g >= 3 ? '#c8323c' : '#e6b84a')); }
+}
+
+function paint(ctx, id, ex) {
+  var d = CHARS[id];
+  ctx.save(); ctx.translate(CX, CY);
+  // 水色光晕
+  ctx.fillStyle = rad(ctx, 0, 120, 380, [0, rgba(d.aura, 0.6), 0.6, rgba(d.aura, 0.22), 1, rgba(d.aura, 0)]);
+  ctx.fillRect(-CX, -CY, PW, PH);
+  var sc = d.male ? 0.98 : 1; ctx.scale(sc, sc);
+  ctx.save(); ctx.translate(0, 110); ctx.rotate(d.tilt); ctx.translate(0, -110); backHair(ctx, d); ctx.restore();
+  body(ctx, d);
+  ctx.save(); ctx.translate(0, 110); ctx.rotate(d.tilt); ctx.translate(0, -110);
+  bun(ctx, d); face(ctx, d, ex); frontHair(ctx, d); ornaments(ctx, d);
+  ctx.restore();
+  ctx.restore();
+  // 底部渐隐
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.fillStyle = lin(ctx, 0, PH - 120, 0, PH, [0, 'rgba(0,0,0,0)', 1, 'rgba(0,0,0,1)']); ctx.fillRect(0, PH - 120, PW, 120);
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+// 高清缓存（1.5 倍），最多保留 8 张，按最近使用淘汰，控制小游戏内存
+var Q = 1.5, cache = {}, order = [];
+function get(id, ex) {
+  ex = ex || 'n';
+  var k = id + ex, i = order.indexOf(k);
+  if (i >= 0) order.splice(i, 1);
+  order.push(k);
+  if (!cache[k]) {
+    var c;
+    if (order.length > 8) { var old = order.shift(); c = cache[old]; delete cache[old]; c.getContext('2d').clearRect(0, 0, c.width, c.height); }
+    else c = P.createCanvas(PW * Q, PH * Q);
+    var x = c.getContext('2d'); x.save(); x.scale(Q, Q); paint(x, id, ex); x.restore();
+    cache[k] = c;
+  }
+  return cache[k];
+}
+module.exports = { Q: Q, get: get, paint: paint, CHARS: CHARS, PW: PW, PH: PH, util: { path: path, lin: lin, rad: rad, rgba: rgba, lighten: lighten, darken: darken, mix: mix, goldFlower: goldFlower, seeded: seeded } };
+
+});
+__d("./js/scenery",function(require,module,exports){
+// 场景背景：程序化绘制并缓存
+var P = require('./platform');
+var U = require('./portrait').util;
+var lin = U.lin, rad = U.rad, rgba = U.rgba, path = U.path;
+
+var THEMES = {
+  title:  { sky: ['#f7e3d4', '#f3efe6', '#cfe6dc'], roof: '#c9a25a', wall: '#b9535a', blossom: '#f6b8c0', sun: '#fff6e0' },
+  gate:   { sky: ['#f9d9c0', '#f6ead8', '#d6e3e6'], roof: '#c89b4e', wall: '#a8424c', sun: '#fff1d0' },
+  hall:   { sky: ['#5a1f24', '#8a2f2c', '#c98a4a'], pillars: '#7a1c22', lantern: 1, floor: '#3a1418' },
+  garden: { sky: ['#dff1e8', '#eef6ee', '#f8e6e2'], roof: '#8fb8a8', wall: '#d9c8b8', blossom: '#f4a9b6', pond: 1 },
+  night:  { sky: ['#141a36', '#27305a', '#4a4a78'], roof: '#0e1226', wall: '#1a1c38', moon: 1, lantern: 1 },
+  room:   { sky: ['#f3e3cc', '#f0dcc0', '#e2c6a2'], lattice: 1, floor: '#b08a66' },
+  cold:   { sky: ['#aab3c2', '#c9cfd8', '#e6e8ec'], roof: '#5a6072', wall: '#8a8e9c', snow: 1, bare: 1 },
+  study:  { sky: ['#e9dcc4', '#e2d2b4', '#c9b48e'], shelves: 1, floor: '#8a6a4a' }
+};
+
+function roof(ctx, x, y, w, h, col) {
+  // 歇山顶剪影
+  ctx.fillStyle = col;
+  path(ctx, 'M ' + (x - w * 0.62) + ',' + (y + h * 0.1) + ' C ' + (x - w * 0.5) + ',' + y + ' ' + (x - w * 0.32) + ',' + (y - h * 0.1) + ' ' + (x - w * 0.24) + ',' + (y - h * 0.62) + ' L ' + (x + w * 0.24) + ',' + (y - h * 0.62) + ' C ' + (x + w * 0.32) + ',' + (y - h * 0.1) + ' ' + (x + w * 0.5) + ',' + y + ' ' + (x + w * 0.62) + ',' + (y + h * 0.1) + ' L ' + (x + w * 0.5) + ',' + (y + h * 0.2) + ' L ' + (x - w * 0.5) + ',' + (y + h * 0.2) + ' Z');
+  ctx.fill();
+  ctx.fillRect(x - w * 0.27, y - h * 0.72, w * 0.54, h * 0.12);
+}
+function branch(ctx, x, y, dir, col, rnd, bare) {
+  ctx.strokeStyle = bare ? 'rgba(70,64,72,.75)' : 'rgba(96,66,60,.8)'; ctx.lineCap = 'round';
+  function seg(x0, y0, ang, len, w, depth) {
+    var x1 = x0 + Math.cos(ang) * len, y1 = y0 + Math.sin(ang) * len;
+    ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.quadraticCurveTo((x0 + x1) / 2 + (rnd() - 0.5) * 30, (y0 + y1) / 2 + (rnd() - 0.5) * 30, x1, y1); ctx.stroke();
+    if (!bare) for (var i = 0; i < 5; i++) {
+      var bx = x0 + (x1 - x0) * rnd() + (rnd() - 0.5) * 40, by = y0 + (y1 - y0) * rnd() + (rnd() - 0.5) * 40, r = 7 + rnd() * 9;
+      ctx.fillStyle = rgba(col, 0.55 + rnd() * 0.35);
+      for (var k = 0; k < 5; k++) { ctx.beginPath(); ctx.ellipse(bx + Math.cos(k * 1.256) * r * 0.6, by + Math.sin(k * 1.256) * r * 0.6, r * 0.5, r * 0.5, 0, 0, 6.3); ctx.fill(); }
+      ctx.fillStyle = 'rgba(255,240,200,.9)'; ctx.beginPath(); ctx.arc(bx, by, r * 0.2, 0, 6.3); ctx.fill();
+    }
+    if (depth > 0) { seg(x1, y1, ang + (rnd() - 0.2) * 0.9 * dir, len * 0.7, w * 0.62, depth - 1); seg(x1, y1, ang - (rnd() + 0.2) * 0.7 * dir, len * 0.6, w * 0.55, depth - 1); }
+  }
+  seg(x, y, dir > 0 ? 0.35 : Math.PI - 0.35, 170, 11, 3);
+}
+
+function paint(ctx, name, W, H) {
+  var t = THEMES[name] || THEMES.garden, rnd = U.seeded(name.length * 131 + 7);
+  ctx.fillStyle = lin(ctx, 0, 0, 0, H, [0, t.sky[0], 0.5, t.sky[1], 1, t.sky[2]]); ctx.fillRect(0, 0, W, H);
+  var hz = H * 0.56;
+  if (t.sun) { ctx.fillStyle = rad(ctx, W * 0.72, H * 0.2, 260, [0, rgba(t.sun, 0.95), 1, rgba(t.sun, 0)]); ctx.fillRect(0, 0, W, H * 0.6); }
+  if (t.moon) {
+    ctx.fillStyle = rad(ctx, W * 0.72, H * 0.16, 300, [0, 'rgba(255,246,214,.5)', 1, 'rgba(255,246,214,0)']); ctx.fillRect(0, 0, W, H * 0.6);
+    ctx.fillStyle = '#fff6da'; ctx.beginPath(); ctx.arc(W * 0.72, H * 0.16, 62, 0, 6.3); ctx.fill();
+    for (var i = 0; i < 70; i++) { ctx.fillStyle = 'rgba(255,255,255,' + (0.3 + rnd() * 0.6) + ')'; ctx.beginPath(); ctx.arc(rnd() * W, rnd() * H * 0.5, rnd() * 1.8, 0, 6.3); ctx.fill(); }
+  }
+  if (t.roof) {
+    // 远山与层叠宫阙
+    ctx.fillStyle = rgba(t.roof, 0.18); path(ctx, 'M 0,' + (hz - 120) + ' C 150,' + (hz - 260) + ' 300,' + (hz - 150) + ' 420,' + (hz - 220) + ' C 560,' + (hz - 300) + ' 660,' + (hz - 160) + ' 750,' + (hz - 200) + ' L 750,' + hz + ' L 0,' + hz + ' Z'); ctx.fill();
+    ctx.globalAlpha = 0.45; roof(ctx, 150, hz - 110, 240, 80, t.roof); ctx.fillStyle = t.wall; ctx.fillRect(60, hz - 94, 180, 100);
+    ctx.globalAlpha = 0.6; roof(ctx, 600, hz - 90, 300, 96, t.roof); ctx.fillStyle = t.wall; ctx.fillRect(490, hz - 70, 220, 90);
+    ctx.globalAlpha = 1; roof(ctx, 375, hz - 30, 520, 150, t.roof);
+    ctx.fillStyle = t.wall; ctx.fillRect(160, hz, 430, 150);
+    ctx.fillStyle = rgba('#000000', 0.18); for (var c = 0; c < 6; c++) ctx.fillRect(176 + c * 80, hz + 10, 10, 140);
+    ctx.fillStyle = t.wall; ctx.fillRect(0, hz + 110, W, 90);
+    ctx.fillStyle = t.roof; ctx.fillRect(0, hz + 96, W, 20);
+    ctx.fillStyle = lin(ctx, 0, hz + 200, 0, H, [0, rgba(t.sky[2], 0.9), 1, t.sky[2]]); ctx.fillRect(0, hz + 200, W, H - hz - 200);
+  }
+  if (t.pond) {
+    ctx.fillStyle = lin(ctx, 0, hz + 220, 0, H, [0, '#cfe9e2', 1, '#a9d6cc']); ctx.fillRect(0, hz + 220, W, H);
+    ctx.strokeStyle = 'rgba(255,255,255,.6)'; ctx.lineWidth = 2;
+    for (var r = 0; r < 9; r++) { var yy = hz + 250 + r * 46; ctx.beginPath(); ctx.moveTo(rnd() * 300, yy); ctx.lineTo(300 + rnd() * 400, yy); ctx.stroke(); }
+    for (var l = 0; l < 7; l++) { ctx.fillStyle = 'rgba(120,180,150,.7)'; ctx.beginPath(); ctx.ellipse(rnd() * W, hz + 280 + rnd() * 300, 46, 16, 0, 0.4, 6.1); ctx.fill(); }
+  }
+  if (t.pillars) {
+    ctx.fillStyle = lin(ctx, 0, H * 0.5, 0, H, [0, t.floor, 1, '#1e0a0c']); ctx.fillRect(0, H * 0.62, W, H);
+    for (var p2 = 0; p2 < 4; p2++) {
+      var px = 40 + p2 * 220, pw = 62;
+      ctx.fillStyle = lin(ctx, px, 0, px + pw, 0, [0, '#5a1218', 0.4, '#a82a2e', 1, '#4a0e14']); ctx.fillRect(px, 0, pw, H * 0.7);
+      ctx.fillStyle = '#d9b05a'; ctx.fillRect(px - 8, H * 0.7 - 30, pw + 16, 30); ctx.fillRect(px - 6, 120, pw + 12, 14);
+    }
+    ctx.fillStyle = lin(ctx, 0, 0, 0, 130, [0, '#2a0a0e', 1, '#6a1a1e']); ctx.fillRect(0, 0, W, 120);
+    ctx.fillStyle = rad(ctx, W / 2, H * 0.36, 380, [0, 'rgba(255,214,140,.5)', 1, 'rgba(255,214,140,0)']); ctx.fillRect(0, 0, W, H);
+    // 屏风
+    ctx.fillStyle = '#d9b05a'; ctx.fillRect(210, H * 0.3, 330, H * 0.32); ctx.fillStyle = '#8a1e24'; ctx.fillRect(222, H * 0.3 + 12, 306, H * 0.32 - 24);
+    ctx.strokeStyle = 'rgba(240,200,110,.7)'; ctx.lineWidth = 3; for (var q = 0; q < 4; q++) { ctx.beginPath(); ctx.arc(375, H * 0.46, 30 + q * 24, 0, 6.3); ctx.stroke(); }
+  }
+  if (t.lattice || t.shelves) {
+    ctx.fillStyle = lin(ctx, 0, H * 0.6, 0, H, [0, t.floor, 1, rgba('#3a2418', 1)]); ctx.fillRect(0, H * 0.64, W, H);
+    if (t.lattice) {
+      ctx.fillStyle = '#fbf3df'; ctx.fillRect(150, H * 0.12, 450, H * 0.4);
+      ctx.fillStyle = rad(ctx, 375, H * 0.3, 300, [0, 'rgba(255,250,225,.9)', 1, 'rgba(255,250,225,0)']); ctx.fillRect(0, 0, W, H * 0.7);
+      ctx.strokeStyle = '#8a5a3a'; ctx.lineWidth = 10; ctx.strokeRect(150, H * 0.12, 450, H * 0.4);
+      ctx.lineWidth = 5; for (var g = 1; g < 6; g++) { ctx.beginPath(); ctx.moveTo(150 + g * 75, H * 0.12); ctx.lineTo(150 + g * 75, H * 0.52); ctx.stroke(); }
+      for (var g2 = 1; g2 < 5; g2++) { ctx.beginPath(); ctx.moveTo(150, H * 0.12 + g2 * H * 0.08); ctx.lineTo(600, H * 0.12 + g2 * H * 0.08); ctx.stroke(); }
+      ctx.fillStyle = 'rgba(190,80,90,.75)'; path(ctx, 'M 0,0 L 150,0 C 130,' + (H * 0.3) + ' 90,' + (H * 0.5) + ' 20,' + (H * 0.66) + ' L 0,' + (H * 0.66) + ' Z'); ctx.fill();
+      path(ctx, 'M 750,0 L 600,0 C 620,' + (H * 0.3) + ' 660,' + (H * 0.5) + ' 730,' + (H * 0.66) + ' L 750,' + (H * 0.66) + ' Z'); ctx.fill();
+    } else {
+      for (var s = 0; s < 3; s++) {
+        var sx = 30 + s * 240; ctx.fillStyle = '#6a4a30'; ctx.fillRect(sx, H * 0.08, 210, H * 0.56);
+        for (var rw = 0; rw < 5; rw++) {
+          var sy = H * 0.1 + rw * H * 0.108; ctx.fillStyle = '#4a321e'; ctx.fillRect(sx + 10, sy, 190, H * 0.09);
+          for (var b = 0; b < 9; b++) { ctx.fillStyle = ['#c9b48e', '#a9b8a8', '#b89a8a', '#d9c9a8'][Math.floor(rnd() * 4)]; var bh = H * 0.05 + rnd() * H * 0.03; ctx.fillRect(sx + 16 + b * 20, sy + H * 0.09 - bh, 16, bh); }
+        }
+      }
+      ctx.fillStyle = 'rgba(255,236,190,.25)'; ctx.fillRect(0, 0, W, H);
+    }
+  }
+  if (t.lantern) {
+    for (var ln = 0; ln < 3; ln++) {
+      var lx = 130 + ln * 245, ly = t.pillars ? 190 : H * 0.34;
+      ctx.fillStyle = rad(ctx, lx, ly, 120, [0, 'rgba(255,190,100,.55)', 1, 'rgba(255,190,100,0)']); ctx.fillRect(lx - 120, ly - 120, 240, 240);
+      ctx.strokeStyle = '#d9b05a'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(lx, ly - 70); ctx.lineTo(lx, ly - 30); ctx.stroke();
+      ctx.fillStyle = '#e0503a'; ctx.beginPath(); ctx.ellipse(lx, ly, 26, 32, 0, 0, 6.3); ctx.fill();
+      ctx.fillStyle = '#f4d27a'; ctx.fillRect(lx - 14, ly - 36, 28, 7); ctx.fillRect(lx - 14, ly + 29, 28, 7);
+      ctx.strokeStyle = '#f4d27a'; ctx.beginPath(); ctx.moveTo(lx, ly + 36); ctx.lineTo(lx, ly + 62); ctx.stroke();
+    }
+  }
+  if (t.blossom) { branch(ctx, -20, H * 0.14, 1, t.blossom, rnd); branch(ctx, W + 20, H * 0.3, -1, t.blossom, rnd); }
+  if (t.bare) { branch(ctx, -20, H * 0.2, 1, '#fff', rnd, true); branch(ctx, W + 20, H * 0.12, -1, '#fff', rnd, true); }
+  if (t.snow) { for (var sn = 0; sn < 140; sn++) { ctx.fillStyle = 'rgba(255,255,255,' + (0.4 + rnd() * 0.6) + ')'; ctx.beginPath(); ctx.arc(rnd() * W, rnd() * H, 1 + rnd() * 3.2, 0, 6.3); ctx.fill(); } ctx.fillStyle = '#f2f4f7'; ctx.fillRect(0, hz + 190, W, 16); }
+  // 水雾
+  for (var m = 0; m < 5; m++) { var mx = rnd() * W, my = hz + 60 + rnd() * 240; ctx.fillStyle = rad(ctx, mx, my, 260, [0, 'rgba(255,255,255,' + (name === 'night' ? 0.1 : 0.4) + ')', 1, 'rgba(255,255,255,0)']); ctx.fillRect(mx - 260, my - 260, 520, 520); }
+}
+var cache = {};
+function get(name, W, H) {
+  var k = name + '|' + Math.round(H);
+  if (!cache[k]) { var c = P.createCanvas(W, Math.round(H)); paint(c.getContext('2d'), name, W, Math.round(H)); cache[k] = c; }
+  return cache[k];
+}
+module.exports = { get: get, DARK: { hall: 1, night: 1 } };
+
+});
+__d("./js/story/ch1",function(require,module,exports){
+module.exports = function (X) {
+  var E = X.EVENTS, DF = X.DEFAULTS;
+  ['home', 'garden', 'library', 'music', 'fengyi', 'zhaoyang', 'cining', 'med', 'shang', 'tang', 'cold'].forEach(function (k) { E[k] = E[k] || []; });
+
+  // ───── 各处的日常（可重复） ─────
+  DF.home = s => s.f.arDead
+    ? ['屋里很静。你自己对镜梳头，梳到一半，习惯性地向后伸手要簪子。', '没有人递过来。', { e: { mao: 3 } }]
+    : ['阿箬替你匀面、描眉，嘴里絮絮说着各宫的闲话。', ['ar', '主子今日气色好！奴婢新学了个“飞仙髻”，保管比昭阳宫那位还好看。', 's'], { e: { mao: 4, ar: 1 } }];
+  DF.garden = s => (s.mao + s.cai >= 40 + s.ch * 13 && !s.f['gd' + s.ch])
+    ? [{ fn: st => { st.f['gd' + st.ch] = 1; } }, '你在回廊下驻足看花，身后忽然有人咳了一声。圣驾竟不知何时到了。', ['hd', '不必多礼。朕只是路过——你方才看花的样子，倒比花耐看。', 's'], { e: { chong: 7 } }]
+    : ['你沿着太液池走了一圈。花开得正好，各宫的人三三两两，彼此打量。', { e: { mao: 1, wang: 2 } }];
+  DF.library = ['你在藏书阁坐了一下午。史书翻到后宫列传，寥寥数行，便是一个女子的一生。', { e: { zhi: 4 } }];
+  DF.music = ['乐坊的教习让你把一支曲子弹了二十遍。指尖磨出了薄茧。', { e: { cai: 4 } }];
+  DF.fengyi = s => s.f.hhDeposed ? ['凤仪宫的门上贴着封条。檐下的铜铃被风吹着，没有人听。', { e: { zhi: 1 } }]
+    : ['你依例往凤仪宫请安。皇后问了几句起居，赐了一盏茶。', ['hh', '宫里日子长，慢慢过。', 'n'], { e: { hh: 2, wang: 2 } }];
+  DF.zhaoyang = s => s.f.gfFall ? ['昭阳宫已经空了。宫人散尽，只剩满院无人修剪的石榴。', { e: { zhi: 1 } }]
+    : ['昭阳宫门前车马不绝。你递了帖子请安，贵妃隔着帘子“嗯”了一声，算是见过。', { e: { gf: 1, wang: 1 } }];
+  DF.cining = ['你到慈宁宫请安，陪太后抄了半卷经。檀香很重，重得让人想睡。', ['th', '字还过得去。心不静，回去再练。', 'n'], { e: { th: 2, wang: 2 } }];
+  DF.med = s => s.aff.sy > 0 ? ['你借口取安神的方子，在太医院坐了一会儿。苏砚在窗下碾药，没有抬头，却把一盏温着的茶推了过来。', { e: { sy: 2, mao: 1 } }]
+    : ['太医院里药香弥漫。当值的老太医替你诊了平安脉，开了些养颜的方子。', { e: { mao: 2 } }];
+  DF.shang = s => s.yin >= 15 ? ['你封了几个红封，托容姑姑分给各处管事。银子递出去，笑脸便递了回来。', { e: { yin: -15, wang: 5, rg: 1 } }]
+    : ['手头不宽裕。你老老实实跟着司正学了一下午规矩。', { e: { wang: 2 } }];
+  DF.tang = s => s.f.wtDead ? ['院门锁着。墙头探出一枝海棠，没有人修剪，开得乱七八糟。', { e: { zhi: 1 } }]
+    : s.f.wtDark ? ['揽月阁的宫人说，林主子不见客。', '你在门外站了一会儿，听见里头有人在练琴，弹错了一个音，又弹错了一个音。', { e: { zhi: 1 } }]
+    : ['你和晚棠在廊下分食一碟桂花糕，说了些不要紧的话。', ['wt', '姐姐来，我这院子才像有人住的。', 's'], { e: { wt: 2 } }];
+  DF.cold = s => {
+    if (!s.f.coldOpen) { var a = ['宫城西北角，一道包着铁皮的窄门，门缝里长着枯草。', '守门的老太监连眼皮都没抬：“贵人走错了。这里头没有人——早就没有人了。”']; a.free = 1; return a; }
+    if (s.f.ysV >= 2 && !s.f.ysTruth) return ['她坐在枯井边，哼着一支你似曾相识的调子，哼到一半就断了，又从头哼起。', '她在等人把后半支接下去。可你接不上。', '（若你通晓音律，或学过那支旧曲……）', { e: { ys: 1 } }];
+    return ['你隔着破窗纸，看见她在给一个并不存在的孩子掖被角。', '你把带来的吃食放在门槛上，没有惊动她。', { e: { ys: 1 } }];
+  };
+
+  // ───── 第一章 · 自由行动事件 ─────
+  E.home.push({ id: 'home1', when: s => s.ch >= 1, scene: [
+    '夜里你睡不着，看见阿箬就着月光，把一个小布袋里的碎银子倒出来，一粒一粒地数。',
+    ['ar', '呀！主子恕罪……奴婢、奴婢在数攒下的月钱。', 'd'],
+    ['ar', '宫女二十五岁能放出去。奴婢算过了，到那时候能攒够四十两。', 'n'],
+    ['ar', '奴婢老家在江边。想开个糖水铺子，桂花的、红豆的，三文钱一碗。主子将来要是……要是能出宫走走，奴婢请主子喝头一碗。', 's'],
+    { c: [
+      { t: '“好。我记下了，头一碗。”', do: [['ar', '那说定了！', 's'], { e: { ar: 8, ren: 1 }, f: 'arDream' }] },
+      { t: '“宫里的话，别说这么满。”', do: [['ar', '……是。奴婢记住了。', 'd'], '她把布袋收了起来。但你看见她的嘴角还是翘着的。', { e: { ar: 4, zhi: 1 }, f: 'arDream' }] }
+    ] }
+  ] });
+
+  E.tang.push({ id: 'tang1', when: s => s.ch === 1, scene: [
+    '棠梨院在最西头，窗纸破了一角，晚棠用自己绣的帕子糊上了。',
+    ['wt', '姐姐来了！我这儿只有陈茶……', 's'],
+    '她倒茶的手在抖。你这才看见桌上摊着一封家书，墨迹被水晕开了一片。',
+    ['wt', '我娘的病又重了。大夫说要用参，一支就要二十两。我一个月的份例，才二两。', 'd'],
+    { c: [
+      { t: '把二十两银子放在她手里', req: s => s.yin >= 20, tip: '需 银两≥20', do: [
+        ['wt', '不、不行！姐姐自己也……', 'c'],
+        ['me', '被子都分过了，银子有什么分不得的。', 's'],
+        '她攥着那锭银子，哭得说不出话。很久以后你还记得，那是她最后一次在你面前哭得这样不设防。',
+        { e: { yin: -20, wt: 12, ren: 2 }, f: 'wtHelp1' }
+      ] },
+      { t: '“我也帮不上什么……你别太伤心。”', do: [
+        ['wt', '我知道的。姐姐肯来听我说，就够了。', 'n'],
+        '她笑了笑，把家书叠好，压在了枕头底下。',
+        { e: { wt: 4 } }
+      ] },
+      { t: '“宫里能弄到银子的路子，不止份例一条。”', do: [
+        ['wt', '姐姐是说……', 'n'],
+        '她没有再问下去。但她低头的时候，眼睛里有什么东西动了一下。',
+        { e: { wt: 3, zhi: 1, ren: -1 } }
+      ] }
+    ] }
+  ] });
+
+  E.zhaoyang.push({ id: 'gf1', when: s => s.ch === 1, scene: [
+    '贵妃传你过去“认认门”。你到时，她正倚在榻上，让宫女一颗一颗地往金盘里拣南珠。',
+    '盘子“不慎”翻了。几十颗珠子滚了一地，滚到你的脚边。',
+    ['gf', '哎呀。{cheng}，劳驾。', 's'],
+    '满殿的宫人都在看你。',
+    { c: [
+      { t: '跪下去，一颗一颗拾起来', do: [
+        '你拾了很久。膝盖硌在金砖上，生疼。',
+        ['gf', '倒是听话。没意思。下去吧。', 'a'],
+        { e: { wang: -3, gf: 0 } }
+      ] },
+      { t: '拾起脚边一颗，双手奉上：“余下的，想来娘娘宫里不缺拾珠的人。”', req: s => s.zhi >= 20 || s.jia >= 26, tip: '需 智谋≥20 或 家世≥26', do: [
+        '殿中静得落针可闻。她身边的大宫女脸都白了。',
+        ['gf', '…………', 'a'],
+        ['gf', '呵。总算来了个长了骨头的。', 's'],
+        ['gf', '本宫最烦两种人：一种是跪得太快的，一种是站着却不知道自己凭什么站着的。你是哪一种，往后看。', 'n'],
+        { e: { gf: 9, wang: 4 }, f: 'gfSpine' }
+      ] },
+      { t: '笑着奉承：“娘娘的珠子，沾了地气更显贵气。”', do: [
+        ['gf', '本宫这儿每天有八十张嘴说这种话。你是第八十一张。', 'a'],
+        ['gf', '拾。拾完了滚。', 'a'],
+        { e: { gf: -3, wang: -2 } }
+      ] }
+    ] }
+  ] });
+
+  E.fengyi.push({ id: 'hh1', when: s => s.ch === 1, scene: [
+    '凤仪宫静得不像有人住。皇后独自坐在窗下，面前一局残棋，黑白都是她自己落的。',
+    ['hh', '请过安便回吧。本宫这里没有什么可巴结的。', 'n'],
+    { c: [
+      { t: '“娘娘这一局，白棋三手之内要丢一条大龙。”', req: s => s.zhi >= 25, tip: '需 智谋≥25', do: [
+        '她抬起眼来。那是她第一次真正看你。',
+        ['hh', '坐。', 'n'],
+        '你们下了一个时辰。她赢了你七目，赢得毫不留情。',
+        ['hh', '棋力尚可，只是太想赢。在这宫里，想赢的人往往输得最早。', 'n'],
+        ['hh', '……逢五的日子，本宫午后得闲。', 'n'],
+        { e: { hh: 9, zhi: 2 }, f: 'hhChess' }
+      ] },
+      { t: '规规矩矩地请安，告退', do: [
+        ['hh', '嗯。', 'n'],
+        '你退到门口时回头看了一眼。她已经重新低下头，对着那局棋，像对着一面镜子。',
+        { e: { hh: 3, wang: 1 } }
+      ] }
+    ] }
+  ] });
+
+  E.cining.push({ id: 'th1', when: s => s.ch === 1, scene: [
+    '太后让你抄《心经》。你抄到第三遍，她忽然开口，眼睛仍闭着。',
+    ['th', '进宫的丫头，哀家见过几千个。每一个，哀家都问同一句话。', 'n'],
+    ['th', '你想要什么？', 'n'],
+    { c: [
+      { t: '“臣妾只求平安。”', do: [['th', '平安。这宫里最贵的东西，你倒会挑。', 'n'], { e: { th: 4 } }] },
+      { t: '“臣妾想得皇上的喜欢。”', do: [['th', '喜欢？', 's'], ['th', '哀家当年也求过这个。求到了，然后呢？', 'n'], { e: { th: 2 } }] },
+      { t: '“臣妾想站得高些。高处看得远。”', do: [
+        '佛珠停了。她睁开眼。',
+        ['th', '高处风大，会摔死人的。', 'n'],
+        ['me', '低处也会死人。只是死得没人知道。', 'n'],
+        ['th', '……抄完这一卷，明日再来。', 's'],
+        { e: { th: 9, ren: -1 }, f: 'thAmb' }
+      ] }
+    ] }
+  ] });
+
+  E.med.push({ id: 'sy1', when: s => s.ch >= 1, scene: [
+    '阿箬夜里发了热，烧得说胡话。按规矩，宫女病了是不能请太医的，只能去领一包不知什么年月的药渣。',
+    '你自己去了太医院。当值的几位都装作在忙，只有窗下一个年轻人放下了药碾。',
+    ['sy', '病人在哪？', 'n'],
+    ['me', '是我的宫女。', 'n'],
+    ['sy', '我问的是病人在哪，没问是谁。', 'n'],
+    '他背起药箱就走。施针、开方、亲手煎药，从头到尾没看你几眼。',
+    ['sy', '三碗水煎一碗，连服三日。', 'n'],
+    ['sy', '……方才失礼了。只是在医者眼里，只有病人，没有贵人。在下苏砚。', 'n'],
+    { e: { sy: 8, ar: 4, ren: 1 }, f: 'syMet' }
+  ] });
+
+  E.library.push({ id: 'fa1', when: s => s.ch >= 1, scene: [
+    '藏书阁只有一个看阁的老太监，背驼得厉害，正用鸡毛掸子一格一格地拂尘。',
+    ['福安', '贵人要看什么书？诗、史、还是佛经？', 'n'],
+    ['福安', '老奴福安，在这阁里四十年了。四十年，没几位主子肯上来。', 'n'],
+    ['福安', '书是好东西啊。人会改口，书不会。只是——', 'n'],
+    ['福安', '只是有些书，被人撕过页。贵人翻到缺页的地方，别声张。', 'n'],
+    '他说完，颤巍巍地走开了。你发现他拂尘时，总是绕开第三根柱子底下的那块地砖。',
+    { e: { zhi: 3 }, inc: 'fa' },
+    { if: s => s.origin === 'zc', then: [
+      '你等他走远，抽出了《承平实录》。承平十九年，冬。',
+      '“御史{xing}……构陷宫闱，妄议先云妃薨逝事，下狱，论斩。”后面半页，是齐根撕掉的。',
+      '先云妃。你把这三个字，在心里默了一遍。',
+      { f: 'zc1' }
+    ] }
+  ] });
+
+  E.music.push({ id: 'tune', when: s => s.ch >= 1 && s.cai >= 26, scene: [
+    '乐坊最里间，有个瞎了一只眼的老乐师，独自对着墙吹一管旧笛。',
+    { sfx: 'zheliu' },
+    '那调子你从未听过。起得极低，像有人隔着很远的水在唤谁的乳名。',
+    ['老乐师', '谁？……哦，是个识曲的。寻常人听到这儿，早走了。', 'n'],
+    ['老乐师', '这支叫《折柳》。十五年前，宫里有位主子最爱吹它，夜夜哄孩子睡觉。', 'n'],
+    ['老乐师', '你想学？学了，可千万别在慈宁宫那位跟前奏。', 'n'],
+    ['老乐师', '为什么？老头子不知道为什么。老头子只知道，上一个奏它的人，如今坟头的草都换过十几茬了。', 'n'],
+    '你学会了。这曲子并不难，难的是吹完之后，心口会空一块。',
+    { e: { cai: 5 }, f: 'tune', item: '旧曲《折柳》' }
+  ] });
+
+  E.shang.push({ id: 'rg1', when: s => s.ch >= 1, scene: [
+    ['rg', '今日教行走坐卧。步幅七寸，裙不可动。', 'n'],
+    '你顶着一碗水，在尚宫局的院子里走了两个时辰。',
+    ['rg', '停。你方才回头看了一眼——看什么？', 'n'],
+    ['me', '姑姑案上有一支笛子。很旧了。', 'n'],
+    '容姑姑的脸上第一次有了点什么，像冰面底下游过一尾鱼，很快又不见了。',
+    ['rg', '……眼睛倒尖。那是故主的遗物。', 'n'],
+    ['rg', '眼睛尖是好事。嘴，要比眼睛慢三步。', 'n'],
+    { e: { wang: 4, rg: 7 } }
+  ] });
+
+  // ───── 第一章 · 主线 ─────
+  X.MAIN[1] = { loc: 'garden', label: '御池边的召见', scene: [
+    { bg: 'garden' },
+    '传话的小太监只说“有人请{cheng}去御池边”，没有说是谁。',
+    '池边柳下，一个人背对着你，正往水里撒鱼食。没有仪仗，没有随从，只着一件半旧的青衫。',
+    ['hd', '来了？不必跪，今日这里没有皇帝。', 'n'],
+    ['hd', '朕……我小时候常来这儿喂鱼。你看它们，一撒食就聚过来，撒完了就散。', 'n'],
+    ['hd', '你说，这池子里的鱼，是自在，还是可怜？', 'n'],
+    { c: [
+      { t: '“自在。有人喂养，无风无浪。”', do: [['hd', '是么。许多人都这么答。', 'n'], { e: { chong: 3 } }] },
+      { t: '“可怜。它们不知道池外还有江海。”', do: [
+        ['hd', '……不知道，或许反倒是福气。', 'd'],
+        '他撒食的手慢了下来。', { e: { chong: 8 } }
+      ] },
+      { t: '“鱼不知道自己在池子里。可怜的，是看鱼的人。”', req: s => s.zhi >= 32, tip: '需 智谋≥32', do: [
+        '他转过身来。',
+        '他看了你很久，久到一尾红鲤跃出水面，又落回去。',
+        ['hd', '你知不知道，这句话换一个人听见，够你死三回。', 'n'],
+        ['me', '所以臣妾只说给喂鱼的人听。', 'n'],
+        ['hd', '…………', 'n'],
+        ['hd', '{name}。朕记住这个名字了。', 's'],
+        { e: { chong: 13, hd: 10 }, f: 'soul1', ach: 'zhiji' }
+      ] },
+      { t: '“臣妾愚钝，不敢妄言。”', do: [['hd', '也罢。宫里不敢说话的人，总比乱说话的人活得长。', 'n'], { e: { chong: 1 } }] }
+    ] },
+    { bg: 'night' },
+    '当夜，凤鸾春恩车停在了你的门前。',
+    '阿箬高兴得打翻了胭脂盒。你坐在车里，听着车轮碾过长街，一声一声，像在数什么。',
+    '…………',
+    { bg: 'room' },
+    '次日清晨，赏赐流水般抬进院子。最后一只锦盒没有签子，阿箬打开，尖叫了一声。',
+    '盒里是一只折了颈的画眉鸟。底下压着一张洒金笺，字迹张扬：',
+    '“会唱的鸟，本宫见得多了。——昭阳宫”',
+    { if: s => s.f.gfSpine, then: ['你把笺子翻过来，背面还有一行小字：“别死太快。怪没意思的。”', '你竟然有点想笑。'] },
+    { e: { chong: 6, wang: 4 } }, { promo: 1 },
+    '午后晚棠来道喜。她笑得很甜，一直在说“真好”“我就知道姐姐会有这一天”。',
+    '只是她的手指，一直在绞着袖口。绞得那块料子，都起了毛。',
+    ['wt', '姐姐……皇上他，是什么样子的？', 'n'],
+    ['wt', '我入宫三个月了，还没见过皇上的正脸呢。', 's'],
+    { ch: 2 },
+    { title: '第二章 · 中秋夜宴', sub: '承熙三年 · 秋' },
+    '夏去秋来。宫里开始预备中秋夜宴——那是低位嫔妃一年里唯一能在御前露脸的机会。',
+    '人人都在预备。有的预备才艺，有的预备别的。'
+  ] };
+};
+
+});
+__d("./js/story/ch2",function(require,module,exports){
+module.exports = function (X) {
+  var E = X.EVENTS;
+
+  E.med.push({ id: 'syNight', when: s => s.ch >= 2 && s.f.syMet && !s.f.coldOpen, scene: [
+    { bg: 'night' },
+    '你来取药时已近掌灯。太医院空了，只有后门虚掩着。',
+    '你看见苏砚提着一只食盒，没有点灯，贴着墙根往西北方向去了。那个方向，只有一处地方。',
+    { c: [
+      { t: '远远地跟上去', do: [
+        '你跟到一道包着铁皮的窄门前。守门的老太监接过他递的碎银，背过了身。',
+        '他推门时回了头，正对上你的眼睛。',
+        ['sy', '…………', 'n'],
+        ['sy', '{cheng}若要告发，现在去慎刑司，还赶得上他们换班。', 'n'],
+        ['me', '里面的人，病得重么？', 'n'],
+        '他怔了一下。',
+        ['sy', '重。十五年了，没有人问过这一句。', 'd'],
+        ['sy', '先师临终托付我的。他说，那位主子没有疯，只是没有人肯让她清醒。', 'n'],
+        ['sy', '你若想进去看看——门，我替你留着。但进去了，就再不能当作没看见。', 'n'],
+        { e: { sy: 6 }, f: 'coldOpen' }
+      ] },
+      { t: '装作没有看见，转身回去', do: [
+        '你回去了。第二天，窗台上多了一小包晒干的合欢花，没有署名。',
+        '安神的。',
+        { e: { sy: 4 } }
+      ] }
+    ] }
+  ] });
+
+  E.cold.push({ id: 'ys1', when: s => s.f.coldOpen, scene: [
+    '门后是一个荒草没膝的院子。正屋的门槛上，坐着一个头发披散的女人。',
+    '她怀里抱着一只褪了色的布老虎，正对着它，一下一下地轻拍。',
+    ['ys', '嘘——珩儿睡了。珩儿夜里怕黑，要哼着曲儿才肯睡的。', 's'],
+    ['ys', '你是新来的奶娘么？你轻些，别吵着他。', 'n'],
+    '珩。你把这个字在心里过了一遍，脊背忽然发凉。当今天子的名讳里，有一个“珩”字。',
+    { c: [
+      { t: '把带来的点心放在她手边，轻声说：“他睡得很好。”', do: [
+        ['ys', '是么……那就好，那就好。', 's'],
+        '她笑起来的样子，竟有一点像某个人撒鱼食时的侧脸。',
+        { e: { ys: 5, sy: 4, ren: 2 }, f: { ysV: 1 } }
+      ] },
+      { t: '太诡异了。退出去', do: [
+        '你退到门边。她没有看你，只是把布老虎搂得更紧了些。',
+        { e: { ys: 1 }, f: { ysV: 1 } }
+      ] }
+    ] }
+  ] });
+  E.cold.push({ id: 'ys2', when: s => s.f.ysV >= 1, scene: [
+    '天凉了。她还穿着那身单衣，袖口磨得起了絮，手指冻得发紫。',
+    '你解下自己的披风，从背后替她围上。她猛地一缩，像是很多年没有被人碰过。',
+    ['ys', '这料子……是云锦。我从前也有一件，是先……是他赏的。', 'n'],
+    ['ys', '后来他们说我疯了，就都收走了。', 'd'],
+    ['ys', '我没有疯。我只是有一件事，不能记起来。记起来，珩儿就活不成了。', 'n'],
+    '她说完这句，眼神又散了，低头去哄那只布老虎。',
+    '走出院门时，苏砚等在暗处，向你深深一揖。',
+    { e: { ys: 6, sy: 4, mao: -1 }, f: { ysV: 2 } }
+  ] });
+
+  E.tang.push({ id: 'tang2', when: s => s.ch === 2, scene: [
+    '晚棠的屋子变了样。窗纸换了新的，案上多了一只鎏金手炉，她腕上是一只水头极好的翡翠镯。',
+    ['wt', '姐姐来啦。这个？是……是太后娘娘赏的。我前些日子去慈宁宫抄经，她老人家说我字好。', 's'],
+    '她说话时没有看你，一直在转那只镯子。',
+    { if: s => s.f.wtHelp1, then: [
+      ['wt', '姐姐，我娘的病好多了。那二十两……我一直记着的。', 'n'],
+      ['wt', '姐姐，要是有一天，我做了一件……', 'd'],
+      ['wt', '没什么。中秋那天，姐姐献的汤羹，千万自己亲手端上去。别过旁人的手。', 'n'],
+      { f: 'wtWarn' }
+    ] },
+    { if: s => s.zhi >= 35, then: [
+      '你注意到她袖口内侧，沾着一点淡黄的粉末。她自己也发现了，飞快地拢了拢袖子。',
+      '那气味很淡，微苦，像杏仁。',
+      { f: 'cWt' }
+    ], else: ['你觉得她有些不一样了。可哪里不一样，你说不上来。'] },
+    { e: { wt: 3 } }
+  ] });
+
+  E.zhaoyang.push({ id: 'gf2', when: s => s.ch >= 2 && s.ch <= 3 && !s.f.gfFall && s.aff.gf >= 8, scene: [
+    { if: s => s.aff.gf >= 8, then: [
+      '昭阳宫白日里竟闭着门。大宫女认得你，迟疑了一下，放你进去了。',
+      '贵妃独自坐在廊下，脚边倒着两只空酒壶。今天是她的生辰，满桌的菜，没有动过。',
+      ['gf', '是你。来看本宫的笑话？', 'a'],
+      ['gf', '他说来的。巳时说午时来，午时说酉时来。现在是什么时辰了？', 'n'],
+      ['gf', '你知道他上一次真心对我笑，是什么时候么？', 'd'],
+      ['gf', '是我爹打下朔州那天。捷报进宫，他握着我的手说：明珠，你是朕的福星。', 'n'],
+      ['gf', '我那时候真高兴啊。高兴得没听出来，他说的是“朔州”，不是“明珠”。', 's'],
+      { c: [
+        { t: '什么也不说，坐下来，替她把酒斟满', do: [
+          ['gf', '……你倒是不劝。', 'n'],
+          ['gf', '他们都劝我“娘娘保重”。保重什么？保重给谁看？', 'n'],
+          '你们对坐着喝完了第三壶。她酒量比你好得多。',
+          ['gf', '今天的事，说出去半个字，本宫撕了你的嘴。', 'a'],
+          ['gf', '……那只画眉的事，对不住。', 'n'],
+          { e: { gf: 9 }, f: 'gfHeart1' }
+        ] },
+        { t: '“娘娘既然看得这样明白，为何还……”', do: [
+          ['gf', '为何还当真？', 's'],
+          ['gf', '因为我顾明珠这辈子，没学过怎么只爱一半。', 'n'],
+          { e: { gf: 7, zhi: 1 }, f: 'gfHeart1' }
+        ] }
+      ] }
+    ], else: [
+      '昭阳宫闭着门。里面隐约有摔东西的声音。',
+      '大宫女隔着门缝说：“娘娘今日不见人。尤其不见来看热闹的人。”',
+      { e: { zhi: 1 } }
+    ] }
+  ] });
+
+  E.fengyi.push({ id: 'hh2', when: s => s.ch >= 2 && !s.f.hhDeposed && s.aff.hh >= 8, scene: [
+    { if: s => s.aff.hh >= 8, then: [
+      '你来得早了些，宫人没有通传。皇后背对着门，膝上摊着几件极小的衣裳，正一件一件地叠。',
+      '叠好，抖开，再叠。',
+      ['hh', '……谁许你进来的。', 'a'],
+      '她没有回头。你也没有退出去。',
+      ['hh', '两年了。尚服局每季还照旧例送婴孩的衣料来，没有人敢去说一声“不必了”。', 'n'],
+      ['hh', '六个月大，已经会动了。太医说是个男孩。', 'd'],
+      ['hh', '那碗安胎药是从昭阳宫的小厨房端来的。人人都这么说。本宫也这么信。', 'n'],
+      ['hh', '恨一个人，日子会好过些。你懂么？', 'n'],
+      { c: [
+        { t: '“臣妾不懂。但娘娘若想下棋，臣妾随时都在。”', do: [
+          ['hh', '…………', 'n'],
+          ['hh', '摆棋吧。今日让你三子。', 'n'],
+          { e: { hh: 9 }, f: 'hhHeart1' }
+        ] },
+        { t: '“娘娘亲眼看见那碗药是谁端来的么？”', req: s => s.zhi >= 40, tip: '需 智谋≥40', do: [
+          '她叠衣裳的手停住了。',
+          ['hh', '你想说什么。', 'a'],
+          ['me', '臣妾什么也不知道。只是学棋时娘娘教过：太顺理成章的一手，往往是别人想让你下的。', 'n'],
+          ['hh', '……出去。', 'n'],
+          '你退到门口，听见她在身后极轻地说了一句：“逢五，照旧。”',
+          { e: { hh: 10, zhi: 1 }, f: 'hhHeart1' }
+        ] }
+      ] }
+    ], else: [
+      '皇后今日神色倦怠，隔着屏风受了你的礼。',
+      ['hh', '本宫乏了。都退下吧。', 'n'],
+      { e: { hh: 2, wang: 1 } }
+    ] }
+  ] });
+
+  E.cining.push({ id: 'th2', when: s => s.ch >= 2 && s.ch <= 3, scene: [
+    '太后今日屏退了左右，亲手给你倒了一盏茶。',
+    ['th', '昭阳宫那位，近来和她兄长通了几回信？她宫里进出的是哪些人？', 'n'],
+    ['th', '哀家老了，耳目不灵。想借你年轻人的眼睛用一用。', 's'],
+    '茶是好茶。你知道，接了这盏茶，就是接了一根线。',
+    { c: [
+      { t: '接过茶：“臣妾愿为太后分忧。”', do: [
+        ['th', '好孩子。', 's'],
+        ['th', '哀家不白用人。你想站高些，哀家有的是梯子。', 'n'],
+        { e: { th: 9, ren: -2, wang: 3 }, f: 'spy' }
+      ] },
+      { t: '“臣妾眼拙心粗，怕误了太后的事。”', do: [
+        { if: s => s.zhi >= 40, then: [
+          ['me', '况且昭阳宫的人最是警醒。臣妾去了反倒打草惊蛇——不如臣妾什么也不做，才是太后在昭阳宫门外最干净的一双眼。', 'n'],
+          ['th', '呵。滑不留手。', 's'], ['th', '去吧。茶留下。', 'n'], { e: { th: 1, zhi: 1 } }
+        ], else: [
+          ['th', '是么。', 'n'],
+          '她把那盏茶，慢慢地泼在了地上。',
+          { e: { th: -5 } }
+        ] }
+      ] }
+    ] }
+  ] });
+
+  E.library.push({ id: 'fa2', when: s => s.ch >= 2 && s.f.fa >= 1, scene: [
+    '福安今日在晒书。见你来，他眯着眼认了半天。',
+    ['福安', '是常来的那位贵人。肯来第二回的，老奴四十年里见过三个。', 'n'],
+    ['福安', '头一个，是先帝的云妃娘娘。她爱在那扇窗下吹笛子，吹得一阁的书都像活了。', 'n'],
+    ['福安', '承平十九年冬天，说是急病，一夜就没了。棺材钉得死死的，连先帝都没让看最后一眼。', 'n'],
+    ['福安', '第二个，是个姓{xing}……不，记岔了，是个御史，来查那年的脉案。后来他也没了。', 'n'],
+    ['福安', '贵人是第三个。老奴多嘴一句：书可以看，别查。', 'd'],
+    { e: { zhi: 3 }, inc: 'fa', f: 'faStory' }
+  ] });
+
+  E.home.push({ id: 'home2', when: s => s.ch === 2 && s.aff.ar >= 8, scene: [
+    '阿箬从外头回来，把门闩上了，脸色发白。',
+    ['ar', '主子，奴婢方才去小厨房领中秋的食材，看见一桩怪事。', 'n'],
+    ['ar', '管汤羹的刘公公，在后巷收了人一包东西。给东西的人蒙着脸，可是……', 'n'],
+    ['ar', '可是那人走路的样子，脚尖有点往里扣。奴婢瞧着眼熟，一时又想不起是哪个宫的。', 'n'],
+    ['ar', '主子，中秋那天的汤，咱们别让小厨房经手了，奴婢亲自盯着熬，行么？', 'd'],
+    '脚尖往里扣。你想起储秀宫那一夜，有个人赤着脚、小心翼翼地走到你榻边。',
+    { e: { ar: 4, zhi: 1 }, f: 'cAr' }
+  ] });
+
+  E.shang.push({ id: 'rg2', when: s => s.ch >= 2 && s.aff.rg >= 6, scene: [
+    ['rg', '中秋夜宴，各宫要进一道汤羹。我只提醒一句。', 'n'],
+    ['rg', '入口的东西，离了自己的眼，便不是自己的了。', 'n'],
+    { if: s => s.aff.rg >= 8 && (s.cai >= 30 || s.f.tune), then: [
+      '你告退时，听见她在身后低低地哼了半句曲子。是《折柳》的起调。',
+      ['me', '姑姑也会这支曲子？', 'n'],
+      ['rg', '…………', 'd'],
+      ['rg', '我十二岁进宫，伺候的头一位主子，夜夜吹它。', 'n'],
+      ['rg', '她待我，像待妹妹。后来她“病故”了，我被发到浣衣局，洗了六年衣裳才爬回来。', 'n'],
+      ['rg', '西北角那道铁皮门，我每年冬至都去门外站一站。不敢进去。', 'n'],
+      ['rg', '你若敢——替我看看，她冷不冷。', 'c'],
+      { e: { rg: 8 }, f: { coldOpen: 1, rgTruth: 1 } }
+    ], else: [{ e: { rg: 5, wang: 2 } }] }
+  ] });
+
+  // ───── 第二章 · 主线：中秋夜宴 ─────
+  var afterFeast = [
+    { promo: 1 },
+    { ch: 3 },
+    { title: '第三章 · 风起', sub: '承熙四年 · 春' },
+    '冬去春来。北境传来消息：镇北大将军顾廷岳奉旨回京“述职”，三十万边军，暂由朝廷派员接管。',
+    '昭阳宫的赏赐反而比往年更厚了。懂的人都懂——杀猪之前，总要喂得饱些。',
+    { if: s => s.f.playedTune, then: [
+      { bg: 'night' }, { bgm: 'tense' },
+      '二月初七夜。你被一阵极轻的响动惊醒——窗纸上，映着一道不属于任何宫人的影子。',
+      '一根细竹管捅破了窗纸，甜腻的烟气涌进来。',
+      { if: s => s.aff.sy >= 12, then: [
+        '你屏住呼吸，摸到枕下那只小瓷瓶——苏砚前日塞给你的，只说了一句“近来夜里不太平”。',
+        '药丸入口极苦。你装作昏睡，听着那人撬开门闩，又在廊下巡夜太监的灯笼光里仓皇退走。',
+        '天亮后，苏砚验了残香，脸色很难看：“慈宁宫佛堂用的安息香，掺了曼陀罗。”',
+        { e: { sy: 3 } }
+      ], else: [{ if: s => s.zhi >= 48 || s.chong >= 40, then: [
+        { if: s => s.zhi >= 48, then: ['你早有防备。自中秋那夜起，你的床榻上躺的便是一卷被褥，人睡在屏风后的矮榻上。', '你攥着剪子，听那人对着空床连刺三刀，然后推倒烛台，高喊：“走水了——！”'],
+          else: ['黑影破窗而入的一瞬，檐上跃下两个人，刀光只一闪。', '是御前的暗卫。为首的向你一拱手：“皇上有旨，{cheng}身边，日夜不离人。”'] },
+        '刺客没能留下活口。但所有人都知道那是谁的人。'
+      ], else: [
+        '你想喊，嗓子却发不出声。手脚像沉在水里。',
+        '最后的知觉，是有人捏开你的嘴，灌进一线温热的液体。',
+        '那支曲子，果然是不能奏的。',
+        { end: 'zhenjiu' }
+      ] }] },
+      { bg: 'garden' }
+    ] }
+  ];
+
+  X.SCENES.feastEnd = afterFeast;
+
+  X.MAIN[2] = { loc: 'garden', label: '中秋夜宴', scene: [
+    { bg: 'night' },
+    '八月十五，琼华台。百盏宫灯映着太液池，丝竹声隔水传来。',
+    '帝后居中，太后在侧，贵妃的席位紧挨着御座，比皇后还近半尺。',
+    '低位嫔妃依次献艺。轮到你了。',
+    { c: [
+      { t: '献上苦练的曲目', do: [
+        { if: s => s.cai >= 45, then: [
+          '一曲终了，满座无声，随即是皇帝带头的击节。',
+          ['hd', '好。赏。', 's'], { e: { chong: 9, wang: 6 } }
+        ], else: [
+          '你弹错了两个音。不算大错，但贵妃用扇子掩着嘴，笑出了声。',
+          ['gf', '{cheng}这是弹棉花呢？', 's'], { e: { wang: -3, chong: 1 } }
+        ] }
+      ] },
+      { t: '向乐师借一管笛子，吹那支《折柳》', if: s => s.f.tune, do: [
+        { sfx: 'zheliu' },
+        '第一个音出来的时候，太后手中的酒盏“当”的一声，落在了案上。',
+        '你没有停。笛声极低，像有人隔着很远的水，在唤谁的乳名。',
+        '皇帝的身子慢慢向前倾了过来。他的脸上，是一种你从未见过的、近乎孩子气的茫然。',
+        ['hd', '这支曲子……朕好像，在很小的时候听过。', 'd'],
+        ['hd', '是谁教你的？', 'n'],
+        ['th', '皇帝。', 'a'],
+        ['th', '不过是民间小调，俗得很。哀家听着头疼。下一个。', 'n'],
+        '你退下时，感觉到一道目光钉在背上，冷得像腊月的井水。',
+        { e: { chong: 10, th: -15, cai: 2 }, f: 'playedTune', ach: 'zheliu' }
+      ] },
+      { t: '“臣妾技拙，不敢污了圣听。”——藏拙', do: ['你安静地坐了回去。没有人记住你，也没有人记恨你。', { e: { zhi: 1 } }] }
+    ] },
+    '献艺毕，各宫进汤羹。你的那盏莲子羹，按位次，恰好被分到了贵妃案前。',
+    '她尝了一口，皱了皱眉，又尝了一口。',
+    { bgm: 'tense' },
+    '第三口没有咽下去。汤匙落地，她整个人向后倒去，唇角溢出一线黑血。',
+    '“有毒——！护驾——！”',
+    '混乱里，有人指向了你。阿箬被两个太监按在地上，脸贴着冰冷的石砖。',
+    ['hd', '{cheng}。这盏羹，是你宫里出来的。', 'a'],
+    ['hd', '朕给你一炷香。', 'n'],
+    { c: [
+      { t: '指出真相：小厨房的刘公公收了人的东西', if: s => (s.f.cAr || s.f.cWt) && s.zhi >= 35, do: [
+        '刘公公被拖上来，没挨到第三板便招了：有人给了他一包“让人出丑的泻药”，让他下在你的羹里。',
+        '那人蒙着脸。但刘公公记得，她腕上有一只水头极好的翡翠镯子。',
+        '你的目光越过人群，落在末席。晚棠坐在那里，脸上一点血色都没有，右手死死按着左腕的袖子。',
+        '只要你说出一个名字。',
+        { ach: 'mingcha' },
+        { c: [
+          { t: '“刘公公所说之人，是棠梨院林采女。”——当众指认', do: [
+            '晚棠被拖到御前时，没有喊冤。她只是看着你，一直看着你。',
+            ['wt', '……是我。', 'd'],
+            ['th', '一个采女，哪来这样的胆子？定是受人蒙蔽。皇帝，交给哀家来审吧。', 'n'],
+            '太后把人带走了。三日后传出话来：林氏年幼无知，为人所惑，罚俸一年，禁足思过。',
+            '所有人都明白了那只镯子是谁给的。也明白了，你动不了她。',
+            { e: { wang: 9, chong: 4, th: -6, wt: -30 }, f: { exposedWt: 1, wtDark: 1 } }
+          ] },
+          { t: '“刘公公既已招认，背后之人蒙面，无从查起。”——替她隐下', req: s => s.zhi >= 42 || s.jia >= 40, tip: '需 智谋≥42 或 家世≥40（否则压不住追查）', do: [
+            '你说得滴水不漏。刘公公当夜“畏罪自尽”，这条线，就此断了。',
+            '散席时，晚棠从你身边走过，脚下一软。你扶了她一把，在她耳边说：“子时，老地方。”',
+            { e: { wang: 5, chong: 3 }, f: 'shieldedWt' },
+            { bg: 'night' },
+            '子时。储秀宫后那间堆杂物的空屋——你们入宫第一夜住的地方。',
+            ['wt', '姐姐为什么不说？！', 'c'],
+            ['wt', '你明明都知道了！你说啊！你让他们把我拖去慎刑司啊！', 'c'],
+            ['wt', '我弟弟在周家的庄子上。九岁。太后的人说，我不听话，就一根一根地送他的手指头进来。', 'd'],
+            ['wt', '那包药，他们说只是泻药，只是让你出个丑……我不知道是毒，我真的不知道……', 'c'],
+            ['wt', '姐姐，你总是站在亮处。你不知道，在暗处的人看亮处，眼睛是会疼的。', 'd'],
+            { c: [
+              { t: '“因为那夜的被子，是你分我一半的。”', do: [
+                '她愣住了。然后像个孩子一样，蹲在地上，哭得喘不上气。',
+                ['wt', '我把簪子弄丢了……我的那支，我不配戴了，我把它扔进井里了……', 'c'],
+                '你拔下自己发间的那一支，放进她手里。',
+                ['me', '那就先替我收着。等你觉得配了，再还我。', 'n'],
+                { drop: '海棠簪', e: { wt: 25, ren: 3 }, f: 'wtBond', ach: 'beizi' }
+              ] },
+              { t: '“你欠我一条命。记着。”', do: [
+                ['wt', '……我记着。', 'd'],
+                '她擦干了眼泪。那一刻你看见，她脸上有什么柔软的东西，正在一点一点地硬起来。',
+                { e: { wt: 6, ren: -1 }, f: 'wtDebt' }
+              ] }
+            ] }
+          ] }
+        ] }
+      ] },
+      { t: '花重金撬开小厨房众人的嘴', if: s => s.origin === 'sg' && !(s.f.cAr || s.f.cWt), req: s => s.yin >= 60, tip: '需 银两≥60', do: [
+        '你当场摘下腕上的金钏：“谁说出今夜有谁动过这盏羹，这就是他的。另有二百两，明早送到。”',
+        '烧火的小太监扑了出来：是刘公公。刘公公没挨到第三板便招了，只说给他药的人蒙着脸。',
+        '线索到此为止。但你的嫌疑，洗清了。',
+        { e: { yin: -60, wang: 5, chong: 2 }, f: 'suspectWt' }
+      ] },
+      { t: '望向榻上的贵妃——她的眼睛，睁开了一线', if: s => s.aff.gf >= 16, do: [
+        '太医正在施针。贵妃醒了，脸白如纸，声音却还是那个声音。',
+        ['gf', '吵死了。', 'a'],
+        ['gf', '不是她。她要是想毒死本宫，不会蠢到下在自己进的羹里。', 'n'],
+        ['gf', '皇上，查小厨房。查不出来，就把这宫里的人，一个一个查过去。', 'n'],
+        '皇帝沉默片刻，摆了摆手。阿箬被放开了。',
+        '你隔着人群看向贵妃。她已经闭上了眼，嘴角撇了一下，像是嫌你欠了她一个天大的人情。',
+        { e: { gf: 5, wang: 3 }, f: { gfDebt: 1, suspectWt: 1 } }
+      ] },
+      { t: '向太后叩首：“求太后为臣妾做主。”', if: s => s.f.spy, do: [
+        ['th', '皇帝，这孩子日日在哀家跟前抄经，心性哀家是知道的。此事另有蹊跷。', 'n'],
+        '太后开了口，便没有人再说话。',
+        '你被她亲手扶起来。她的指甲在你腕上，不轻不重地掐了一下。',
+        ['th', '记着，这是哀家给你的第二架梯子。', 's'],
+        { e: { th: 6, wang: 2 }, f: 'owedTh' }
+      ] },
+      { t: '直视他的眼睛：“皇上信臣妾么？”', req: s => s.chong >= 22, tip: '需 圣宠≥22', do: [
+        '很长的沉默。',
+        ['hd', '……朕信。', 'n'],
+        ['hd', '但朕信，不够。宫女阿箬侍奉不周，杖二十。此事交慎刑司严查。', 'a'],
+        '阿箬被拖下去时，回头冲你挤出一个笑，嘴型在说：主子，不疼。',
+        '她在榻上趴了一个月。',
+        { e: { chong: -4, ar: 6 }, f: 'arHurt' }
+      ] },
+      { t: '你张了张口，什么也说不出', do: [
+        '一炷香燃尽了。',
+        '就在皇帝要开口的那一刻，被按在地上的阿箬，忽然挣起了半个身子。',
+        { bgm: 'night' },
+        ['ar', '是奴婢！是奴婢一个人做的！', 'c'],
+        ['ar', '贵妃娘娘上回当众羞辱我家主子，奴婢气不过……主子什么都不知道！羹是奴婢熬的，药是奴婢下的！', 'c'],
+        ['me', '阿箬——！', 'c'],
+        ['ar', '主子别说话。', 'd'],
+        ['ar', '主子，奴婢的钱袋在枕头芯子里。二十九两，离四十两还差十一两。', 's'],
+        ['ar', '那碗糖水……主子替奴婢，尝一尝吧。', 's'],
+        '她没有再看你。她被拖过长长的白玉阶，一路上，再没有出过一声。',
+        { bg: 'room' },
+        '三日后，你在她的枕头里找到了那只布袋。二十九两碎银，一粒一粒，磨得很亮。',
+        '还有一张叠得很小的纸，上面歪歪扭扭地画着一间铺子，门口挂着幌子，幌子上写着她唯一会写的两个字：',
+        '“糖水”。',
+        { e: { chong: -6, wang: -6, ren: 0 }, f: 'arDead', ach: 'hongzhu', item: '阿箬的钱袋' }
+      ] }
+    ] },
+    { if: s => !s.f.exposedWt && !s.f.shieldedWt, then: [
+      { bg: 'room' },
+      '夜深，晚棠来看你。她抱住你，抱得很紧，肩膀一直在抖。',
+      ['wt', '姐姐没事就好……没事就好……', 'c'],
+      { if: s => s.zhi >= 30, then: ['她的袖口蹭过你的脸。你闻到一股极淡的苦杏仁味。', '你没有动。只是抬起手，慢慢地，拍了拍她的背。', { f: 'suspectWt' }] },
+      '入冬后，太后以“字好、心静”为由，晋林采女为才人，迁揽月阁。',
+      { f: 'wtDark' }
+    ] },
+    { if: s => s.f.wtDebt, then: ['入冬后，太后晋林采女为才人，迁揽月阁。她来辞行时，妆容精致，再没有提起那一夜。', { f: 'wtDark' }] },
+    { go: 'feastEnd' }
+  ] };
+};
+
+});
+__d("./js/story/ch3",function(require,module,exports){
+module.exports = function (X) {
+  var E = X.EVENTS;
+  var has = (s, it) => s.items.indexOf(it) >= 0;
+
+  E.cold.push({ id: 'ys3', when: s => s.f.ysV >= 2 && s.ch >= 3 && (s.f.tune || s.cai >= 55), scene: [
+    '她又坐在枯井边，哼着那支断了半截的调子。',
+    { if: s => s.f.tune, then: ['你认出来了。你从袖中取出笛子，从她断掉的地方，接了下去。'], else: ['你听了三遍，记住了前半支的走向。你取出笛子，试着顺着那旋律往下走——音律自有它的去处。'] },
+    { sfx: 'zheliu' },
+    '《折柳》。起得极低，像有人隔着很远的水，在唤谁的乳名。',
+    '布老虎从她怀里滑了下去。她没有去捡。',
+    '她慢慢转过头来，那双浑浊了十五年的眼睛，一点一点地，清了。',
+    ['ys', '……承熙几年了？', 'n'],
+    ['me', '四年。', 'n'],
+    ['ys', '那珩儿，二十三了。他……长得高么？夜里还怕不怕黑？', 'c'],
+    ['ys', '我是先帝的云妃。承平十九年冬，周氏端来一碗药，说我若不“病故”，死的就是我儿子。', 'n'],
+    ['ys', '先帝那时已经病得起不来身了。他的药，也是周氏一勺一勺喂的。', 'd'],
+    ['ys', '她没有杀我。因为先帝临终前写了一道密诏，她找了十五年，没有找到。她要留着我的命，慢慢地问。', 'n'],
+    ['ys', '我只好疯。疯子的话没人信，疯子也就不必开口。', 's'],
+    ['ys', '孩子，我只能清醒这一炷香。再久，守门的人会看出来。你走吧。', 'n'],
+    ['ys', '下回来……若是秋天以后，我有一样东西，托付给你。', 'n'],
+    { e: { ys: 12, sy: 4, cai: 2 }, f: 'ysTruth', ach: 'lenggong' }
+  ] });
+
+  E.tang.push({ id: 'tang3', when: s => s.ch === 3, scene: [
+    { if: s => s.f.wtBond, then: [
+      '晚棠瘦了很多。你那支海棠簪，她没有戴，用帕子包着，贴身收在衣襟里。',
+      ['wt', '姐姐，我打听到了。弟弟关在城南周家的庄子上，看守只有四个人。', 'n'],
+      ['wt', '可是我出不去，也没有人可托……', 'd'],
+      { c: [
+        { t: '拿出四十两，托宫外镖行去“接”人', req: s => s.yin >= 40, tip: '需 银两≥40', do: [
+          '半个月后，一封没有落款的信辗转递进来，里头夹着一张孩子画的画：两个小人牵着手，旁边歪歪扭扭写着“阿姐”。',
+          ['wt', '…………', 'c'],
+          ['wt', '姐姐。从今往后，太后让我做什么，我都先来告诉你。', 'n'],
+          ['wt', '我这条命是脏的了。可它是你的。', 'n'],
+          { e: { yin: -40, wt: 20, ren: 2 }, f: 'wtBrother' }
+        ] },
+        { t: '写信给家中，请父兄派人', req: s => s.jia >= 45, tip: '需 家世≥45', do: [
+          '家里回信只有四个字：“已妥。勿念。”随信捎来一只孩子戴的长命锁。',
+          ['wt', '姐姐。从今往后，太后让我做什么，我都先来告诉你。', 'c'],
+          { e: { wt: 20, ren: 2 }, f: 'wtBrother' }
+        ] },
+        { t: '“再等等。现在动，会打草惊蛇。”', do: [
+          ['wt', '……嗯。我听姐姐的。', 'd'],
+          '她点了点头。可你看得出来，她已经等不起了。',
+          { e: { wt: -4 } }
+        ] }
+      ] }
+    ], else: [{ if: s => s.f.exposedWt, then: [
+      '揽月阁。她让你在廊下站了半个时辰，才慢慢走出来。满头珠翠，眉眼凌厉，你几乎认不出。',
+      ['wt', '{cheng}有事？', 'a'],
+      ['wt', '哦，是来看我过得好不好。托你的福，好得很。', 's'],
+      ['wt', '那天在御前，你教了我一件事：这宫里没有姐妹。我学得快，是不是？', 'n'],
+      { e: { wt: -5, zhi: 1 } }
+    ], else: [
+      '揽月阁比棠梨院大了三倍。晚棠出来迎你，笑容得体，礼数周全。',
+      ['wt', '姐姐如今是贵人了，还肯来看我。', 's'],
+      '她亲手给你奉茶。你们说了半个时辰的话，没有一句是真的。',
+      '临走时，她忽然在身后说：',
+      ['wt', '姐姐。那支海棠簪……你还留着么？', 'd'],
+      { c: [
+        { t: '“一直戴着。”', if: s => has(s, '海棠簪'), do: [['wt', '……是么。', 'd'], '她别过脸去，许久没有说话。', { e: { wt: 6 } }] },
+        { t: '“早不知丢到哪里去了。”', do: [['wt', '也是。那种不值钱的东西。', 's'], { e: { wt: -6 }, drop: '海棠簪' }] }
+      ] }
+    ] }] }
+  ] });
+
+  E.zhaoyang.push({ id: 'gf3', when: s => s.ch === 3 && s.f.gfHeart1, scene: [
+    '昭阳宫的石榴开了，红得像火。贵妃在院子里射箭，十箭里有九箭正中靶心。',
+    ['gf', '我爹教的。他说顾家的女儿，可以不会绣花，不能不会杀人。', 's'],
+    ['gf', '我哥昨日被召回京了，连副将都没让带。你懂这是什么意思。', 'n'],
+    '她放下弓，在石阶上坐下来，一点仪态也不顾了。',
+    ['gf', '我早知道。他看我的时候，看的是顾家三十万兵马。', 'n'],
+    ['gf', '可我还是把每一次都当了真。{name}，你说我是不是这宫里头一号的蠢人？', 'd'],
+    ['me', '不是蠢。是娘娘比他们都干净。', 'n'],
+    ['gf', '…………', 'n'],
+    ['gf', '窗下那盆兰草，是我从家里带来的。娇气得很，三天不见太阳就蔫。', 'n'],
+    ['gf', '哪天我不在了，替我把它搬到太阳底下。别的，什么都不用管。', 's'],
+    { e: { gf: 12 }, f: 'gfHeart2' }
+  ] });
+
+  E.fengyi.push({ id: 'hh3', when: s => s.ch >= 3 && s.f.hhHeart1 && s.zhi >= 50 && !s.f.hhDeposed, scene: [
+    '逢五。棋下到中盘，你忽然停了手。',
+    ['me', '娘娘，臣妾翻过尚食局两年前的档。昭阳宫小厨房那几日，在修灶。', 'n'],
+    ['me', '修了七天。那七天，昭阳宫的膳食都是从御膳房传的。它端不出一碗安胎药。', 'n'],
+    '皇后捏着棋子的手指，一根一根地白了。',
+    ['hh', '……药是慈宁宫的秦嬷嬷亲手端来的。她说，是贵妃的一片心意，托她转交。', 'd'],
+    ['hh', '本宫是太后亲自挑的皇后。沈家是太后的姻亲。她为什么要——', 'n'],
+    ['me', '因为嫡子一旦落地，娘娘就不再需要太后了。', 'n'],
+    '棋子落在盘上，滚了两滚，停在天元。',
+    ['hh', '本宫要证据。脉案、药渣、方子，什么都行。', 'a'],
+    ['hh', '{name}。拿来给我。', 'n'],
+    { e: { hh: 8 }, f: 'hhDoubt' }
+  ] });
+
+  E.med.push({ id: 'syProof', when: s => s.ch >= 3 && s.f.hhDoubt && s.aff.sy >= 14, scene: [
+    '你把来意说了。苏砚沉默了很久，起身闩上门，从药柜最底层抽出一本发黄的册子。',
+    ['sy', '承熙元年，皇后的安胎方是先师拟的。这是底档。', 'n'],
+    ['sy', '这是当日实际送进凤仪宫的方子。多了一味红花、一味麝香。改方的批条上，盖的是慈宁宫的小印。', 'n'],
+    ['sy', '先师发现后的第三天，“失足”落了井。这本册子，是他提前缝在我棉袍里的。', 'd'],
+    ['sy', '我藏了它两年，不知道该交给谁。现在我知道了。', 'n'],
+    { e: { sy: 4 }, item: '改方脉案' }
+  ] });
+  E.med.push({ id: 'syGui', when: s => s.ch >= 3 && s.aff.sy >= 20, scene: [
+    '苏砚今日没有碾药。他面前摆着一只小小的白瓷瓶，看了很久。',
+    ['sy', '这叫“龟息散”。服下之后，气息脉搏全无，状如新死，十二个时辰后自醒。', 'n'],
+    ['sy', '先师配的，原是想救西北角那位出去。她不肯。她说她走了，有人会拿她的孩子出气。', 'n'],
+    ['sy', '天底下只此一剂。你最近总看着宫墙发呆——我想，或许你用得上。', 'n'],
+    { c: [
+      { t: '“我想救一个人。一个所有人都盼着她死的人。”', if: s => s.f.gfHeart2, do: [
+        ['sy', '昭阳宫那位。', 'n'],
+        ['sy', '她骂过我庸医。……拿去吧。医者眼里，只有病人。', 's'],
+        { e: { sy: 3, ren: 1 }, item: '龟息散' }
+      ] },
+      { t: '“我想给自己留一条退路。”', do: [
+        ['sy', '好。', 'n'],
+        ['sy', '若真有那一天——出了神武门往南，过三座桥，有间没挂招牌的药铺。我在那儿等。', 'n'],
+        { e: { sy: 3 }, item: '龟息散' }
+      ] }
+    ] }
+  ] });
+
+  E.cining.push({ id: 'th3', when: s => s.ch >= 3 && s.ch <= 4 && s.f.spy && s.aff.th >= 14 && !s.f.playedTune, scene: [
+    '你把昭阳宫的动静一一禀了。太后听完，赏了你一匣东珠，却没有让你退下。',
+    ['th', '哀家十四岁入宫。学会的头一件事，是这宫里没有人会因为你良善，就让你活着。', 'n'],
+    ['th', '皇后是哀家挑的，可她的心野了。贵妃是皇帝的刀，刀用钝了，自然有人替他扔。', 'n'],
+    ['th', '哀家瞧了你一年。你不蠢，不软，也不怎么要脸。很好。', 's'],
+    ['th', '哀家可以让你做下一个皇后。只要你记得，凤座是谁给的。', 'n'],
+    { c: [
+      { t: '跪下，接过她递来的那盏茶', do: [
+        ['th', '起来。从今日起，哀家教你些真东西。', 's'],
+        '那个下午，她教你怎么看一个人的手——说谎的人，手比嘴先动。',
+        { e: { th: 10, zhi: 5, ren: -3, yin: 30 }, f: 'thPact', ach: 'quanshu' }
+      ] },
+      { t: '“臣妾福薄，担不起凤座。”', do: [
+        ['th', '不识抬举，也是一种本事。', 'n'],
+        ['th', '东珠留着吧。往后，不必来了。', 'a'],
+        { e: { th: -10, yin: 20 } }
+      ] }
+    ] }
+  ] });
+
+  E.garden.push({ id: 'hd3', when: s => s.ch === 3 && s.f.soul1, scene: [
+    '又是御池边。他一个人站在那儿，没有喂鱼。',
+    ['hd', '顾廷岳回京了。兵符交得很痛快，一句怨言都没有。', 'n'],
+    ['hd', '他越是痛快，朕越是不能留他。你说可笑不可笑。', 'n'],
+    ['me', '皇上想听实话？', 'n'],
+    ['hd', '这宫里，朕只在你这儿还听得到实话。', 'd'],
+    { c: [
+      { t: '“顾家有罪无罪，皇上心里比谁都清楚。”', do: [
+        ['hd', '……是。朕清楚。', 'd'],
+        ['hd', '朕连喜欢谁、厌弃谁，都要先问问这江山答不答应。朕有时候想，坐在这把椅子上的，究竟是朕，还是一件龙袍。', 'n'],
+        '他没有降罪于你。但那天之后，他有很久没有召见任何人。',
+        { e: { chong: 6, hd: 8, ren: 1 }, f: 'hdOpen' }
+      ] },
+      { t: '“皇上是天子。天子做的事，没有可笑的。”', do: [
+        ['hd', '……连你也这么说了。', 'n'],
+        '他笑了笑，那笑意没有到眼睛里。',
+        { e: { chong: 5 } }
+      ] }
+    ] }
+  ] });
+  E.garden.push({ id: 'hd3b', when: s => s.ch >= 3 && s.f.playedTune && !s.f.hdSuspect, scene: [
+    '皇帝屏退了所有人。',
+    ['hd', '中秋那支曲子，朕让人查了。乐坊的谱库里没有，教坊司的老人都说没听过。', 'n'],
+    ['hd', '可朕记得它。朕记得有一只手拍着朕的背，袖口有药香。太后的袖口，从来只有檀香。', 'n'],
+    ['hd', '他们都说朕的生母云妃，在朕七岁那年病故了。朕连她的脸都记不清。', 'd'],
+    ['hd', '{name}，你到底知道些什么？', 'n'],
+    { c: [
+      { t: '“臣妾现在还不能说。但臣妾会把答案，带到皇上面前。”', do: [['hd', '……好。朕等。', 'n'], ['hd', '在那之前，朕的人会守着你。', 'n'], { e: { chong: 6, hd: 6 }, f: 'hdSuspect' }] },
+      { t: '“只是偶然学来的小调，臣妾不知其来历。”', do: [['hd', '是么。', 'n'], '他看了你很久，没有再问。', { e: { chong: -2 }, f: 'hdSuspect' }] }
+    ] }
+  ] });
+
+  E.library.push({ id: 'zc3', when: s => s.origin === 'zc' && s.ch >= 3 && s.f.faStory && s.zhi >= 52, scene: [
+    '你把《承平实录》的装订线一针一针地拆开。缺掉的那半页自然不在，但下一页的纸背上，留着极浅的压痕。',
+    '你用炭粉轻轻扫过。字迹浮了出来，是父亲的笔迹——他在被撕去的那一页上，写过批注。',
+    '“云妃脉案三处涂改，太医院判暴卒，所涉宫人十一名，一月内尽数‘病故’。臣请开棺。”',
+    '福安不知何时站在了你身后。',
+    ['福安', '贵人姓的不是这个姓吧。', 'n'],
+    ['福安', '老奴认得这眉眼。{xing}……不，那位御史大人，当年就坐在贵人现在坐的位子上。', 'n'],
+    ['福安', '他被带走那天，往老奴手里塞了这个。说，若有一日他的孩子寻来——', 'd'],
+    '那是一本巴掌大的手札。扉页上写着：“吾儿亲启。爹没有做错事。”',
+    '你把它贴在心口，很久，很久。',
+    { e: { zhi: 3 }, item: '父亲手札' }
+  ] });
+
+  E.shang.push({ id: 'rg3', when: s => s.ch >= 3 && s.aff.rg >= 12 && !s.f.rgTruth, scene: [
+    '容姑姑今日没有教规矩。她把那支旧笛子放在你面前。',
+    ['rg', '你常往西北角去。别否认，守门的老吴是我同乡。', 'n'],
+    ['rg', '我伺候的头一位主子，是先帝的云妃。她“病故”那年我十四岁，被发去浣衣局洗了六年衣裳。', 'n'],
+    ['rg', '这支笛子是她的。你带进去，她认得。', 'c'],
+    { e: { rg: 8 }, f: { rgTruth: 1, coldOpen: 1, tune: 1 }, item: '云妃旧笛' }
+  ] });
+
+  // ───── 第三章 · 主线：昭阳宫的白绫 ─────
+  X.MAIN[3] = { loc: 'zhaoyang', label: '昭阳宫的白绫', scene: [
+    { bg: 'hall' },
+    '四月十九。镇北大将军顾廷岳以“私通北狄、图谋不轨”下狱。证据是三封书信——人人都知道那是怎么来的。',
+    '当日午后，旨意到了昭阳宫：贵妃顾氏，褫夺封号，三日后，赐白绫。',
+    { f: 'gfFall' }, { bgm: 'night' },
+    '一夜之间，门庭若市的昭阳宫空了。宫人们卷了细软四散，连那只鎏金鸟笼都被人顺走了。',
+    '六宫都在看：谁会去，谁不会去。',
+    { c: [
+      { t: '去，带着那瓶龟息散', if: s => s.f.gfHeart2 && has(s, '龟息散'), do: [
+        '她换了一身素衣，散着头发，坐在空荡荡的殿中央。没有哭，背挺得笔直。',
+        ['gf', '你怎么来了。这时候沾上我，你不要命了？', 'a'],
+        '你把白瓷瓶放在她掌心，把苏砚的话一字一字说了。',
+        ['gf', '…………', 'n'],
+        ['gf', '假死。然后呢？隐姓埋名，像只老鼠一样活着？', 'a'],
+        ['me', '然后去北境。你哥哥的旧部还在，三十万人里，总有人记得顾家的大小姐十箭九中。', 'n'],
+        ['me', '顾明珠，你说过顾家的女儿不能不会杀人。那你也该会——活。', 'n'],
+        '她盯着你，眼眶一点一点地红了。这是你头一回见她哭，她哭起来也是凶的，像要咬人。',
+        ['gf', '我顾明珠这辈子，没欠过谁。', 'c'],
+        ['gf', '……欠你的，我拿命还。', 'c'],
+        '三日后，白绫悬梁。太医验过，气息全无。',
+        '当夜，一辆运恭桶的板车出了西华门。赶车的年轻人戴着斗笠，袖口有药香。',
+        { drop: '龟息散', e: { gf: 30, ren: 4, sy: 4 }, f: 'gfSaved', ach: 'mingzhu' },
+        '你回到昭阳宫，把窗下那盆兰草，搬到了太阳底下。',
+        { ach: 'lancao' }
+      ] },
+      { t: '去送她一程', if: s => s.aff.gf >= 8, do: [
+        '她换了一身素衣，散着头发，坐在空荡荡的殿中央。没有哭，背挺得笔直。',
+        ['gf', '是你。满宫里，就来了你一个。', 'n'],
+        ['gf', '别那副表情。我顾明珠风光了六年，够本了。', 's'],
+        ['gf', '替我带句话给他：朔州是我爹打下来的，他坐得稳这江山，有我顾家十七条人命垫着。让他夜里，睡安稳些。', 'a'],
+        ['gf', '还有。你自己当心。你现在得宠的样子，和六年前的我，一模一样。', 'n'],
+        '三日后，昭阳宫抬出一口薄棺。没有谥号，没有丧仪。',
+        '你回去，把窗下那盆兰草搬到了太阳底下。它蔫了几日，又活了。',
+        { e: { ren: 2, wang: -2 }, f: { gfDead: 1, gfFarewell: 1 }, ach: 'lancao' }
+      ] },
+      { t: '向皇上求情', req: s => s.chong >= 45, tip: '需 圣宠≥45', do: [
+        { bg: 'night' },
+        '你在乾元殿外跪了两个时辰。他终于出来了，脸上没有表情。',
+        ['hd', '你以为朕不知道她无辜？', 'a'],
+        ['hd', '顾家军只认顾字旗。她活着一日，那三十万人就有一日的念想。', 'n'],
+        ['hd', '朕对她有愧。可朕是皇帝，皇帝的愧疚，一文不值。', 'd'],
+        ['hd', '回去。今夜的话，朕当你没说过。再有下次——', 'a'],
+        '他没有说完。你也不需要他说完。',
+        '三日后，昭阳宫抬出一口薄棺。',
+        { e: { chong: -15, hd: -5, ren: 2 }, f: { gfDead: 1, hdTrue: 1 } }
+      ] },
+      { t: '上疏：顾氏跋扈六年，罪有应得', do: [
+        '你的折子递得最早，措辞最狠。别的嫔妃见风使舵，纷纷跟上。',
+        '太后在慈宁宫点了头。皇帝的赏赐当晚就到了。',
+        '行刑那日你没有去。但她的大宫女托人带来一句话：',
+        '“娘娘说，她在下面等着看。看你能比她多活几年。”',
+        { e: { chong: 6, wang: 10, th: 6, ren: -6 }, f: 'gfDead' }
+      ] },
+      { t: '闭门不出', do: [
+        '你称病，三日没有出门。',
+        '第三日傍晚，西边传来隐约的钟声。阿箬——或是别的什么人——在门外轻声说：昭阳宫，没了。',
+        { f: 'gfDead' }
+      ] }
+    ] },
+    { bg: 'room' },
+    '贵妃之位空了出来。后宫的格局，一夜之间重新洗过。',
+    { e: { chong: 5, wang: 5 } }, { promo: 1 },
+    { if: s => s.f.wtDark, then: ['同一道旨意里，林才人晋为婕妤——太后亲口提的。', '册封那日，她自你面前走过，裙摆上的金线海棠，刺得人眼睛疼。'] },
+    { ch: 4 },
+    { title: '第四章 · 凤位', sub: '承熙四年 · 秋' },
+    '顾家倒了，朝堂上只剩周家一家独大。皇帝与太后之间那层温情的纱，薄得快要透光。',
+    '而凤仪宫里的那个人，夹在中间。'
+  ] };
+};
+
+});
+__d("./js/story/ch4",function(require,module,exports){
+module.exports = function (X) {
+  var E = X.EVENTS;
+  var has = (s, it) => s.items.indexOf(it) >= 0;
+
+  E.library.unshift({ id: 'mz', when: s => has(s, '半块玉佩') && s.f.faStory, scene: [
+    '你把那半块玉佩放在福安面前。老人手里的鸡毛掸子，掉在了地上。',
+    ['福安', '……云主子，还活着？', 'c'],
+    '他跪了下去，向着西北角的方向，磕了三个头，额头在地砖上磕出了血印。',
+    ['福安', '先帝爷驾崩前三日，夜里一个人来过这阁子。他已经走不动路了，是老奴背上来的。', 'n'],
+    ['福安', '他说：福安，这宫里朕能信的，只剩一个不识字的老东西了。', 'd'],
+    ['福安', '老奴守着第三根柱子，守了十五年。老奴不识字，不知道里头写的是什么。老奴只知道，要等一个拿着另半块玉佩来的人。', 'n'],
+    '地砖撬开，是一只蜡封的铜管。黄绫已经发脆，朱砂御印却还鲜红如血。',
+    '“朕若暴崩，必周氏所为。云妃未死，囚于西宫。皇六子景珩，云氏所出，朕之骨血……见此诏者，如朕亲临。”',
+    { e: { zhi: 3 }, item: '先帝密诏', ach: 'mizhao' }
+  ] });
+
+  E.cold.push({ id: 'ys4', when: s => s.f.ysTruth && s.ch >= 4, scene: [
+    '入秋了。她今日是清醒的，像是专程在等你。',
+    ['ys', '孩子，过来。', 'n'],
+    '她从贴身的衣缝里，拆出半块玉佩。断口参差，玉质温润，上面只有半个字：“平”。',
+    ['ys', '先帝的年号是承平。这块玉，他一半，我一半。他的那一半，和密诏放在一处。', 'n'],
+    ['ys', '藏书阁有个叫福安的老太监，不识字，是先帝最后信的人。把这个给他看。', 'n'],
+    ['ys', '我原想把它带进棺材。可你给我披过衣裳，接过我的曲子。', 's'],
+    ['ys', '替我告诉珩儿——不，什么也别告诉他。让他好好地，做他的皇帝。', 'c'],
+    { e: { ys: 10, sy: 4 }, item: '半块玉佩' }
+  ] });
+
+  E.fengyi.push({ id: 'hh4', when: s => s.ch >= 4 && has(s, '改方脉案') && !s.f.hhDeposed, scene: [
+    '你把那本发黄的册子，推到棋盘中央。',
+    '皇后一页一页地翻。翻到盖着慈宁宫小印的那张批条时，她停住了，很久没有动。',
+    '然后她站起来，把一整盘棋，掀了。',
+    '三百六十一枚云子砸在金砖上，响声像下了一场冰雹。',
+    ['hh', '两年了。', 'a'],
+    ['hh', '我日日晨昏定省，亲手给她奉茶，跪着听她教我“为后之道”。', 'a'],
+    ['hh', '我向杀我孩儿的人，磕了七百多个头。', 'c'],
+    '你第一次听见她不自称“本宫”。',
+    ['hh', '{name}。这凤座是把椅子，也是口棺材，只是坐上去的人还喘着气。', 'n'],
+    ['hh', '我早就不想坐了。但在下去之前，我要把该带走的人，一起带走。', 'a'],
+    ['hh', '从今日起，六宫的印信、内廷的侍卫名册，你要看什么，尽管来取。', 'n'],
+    { drop: '改方脉案', e: { hh: 22, wang: 6 }, f: 'hhAlly', ach: 'luozi' }
+  ] });
+
+  E.tang.push({ id: 'tang4', when: s => s.ch === 4, scene: [
+    { if: s => s.f.wtBrother, then: [
+      '晚棠深夜来的，披着宫女的斗篷。她把一卷东西塞进你手里，手心全是汗。',
+      ['wt', '太后的手令。冬至夜，周家私兵扮作傩戏班子入宫，以慈宁宫钟声为号。', 'n'],
+      ['wt', '她让我那晚在皇上的酒里……我应下了，没有做。这是她亲笔写的，盖着凤印。', 'n'],
+      ['wt', '姐姐，我去作证。当着所有人的面，我把我做过的事，一桩一桩全说出来。', 'd'],
+      ['me', '那你自己呢？', 'n'],
+      ['wt', '该怎么罚就怎么罚。我想干干净净地，把那支簪子还给你。', 's'],
+      '她从衣襟里取出帕子，一层层打开。两支海棠簪并在一处，正好是一朵完整的花。',
+      { e: { wt: 15, ren: 2 }, item: '太后手令', f: 'wtEvidence', ach: 'tangli' }, { item: '海棠簪' }
+    ], else: [{ if: s => s.f.exposedWt, then: [
+      '林婕妤遣人送来一匣点心，说是“赔从前的不是”。',
+      { if: s => s.zhi >= 58, then: [
+        '你没有碰。你让人把匣子原样抬到尚食局，当着司膳的面打开验看。',
+        '夹层里是一只扎着针的小布人，背后写着皇后的生辰。若是在你屋里被搜出来——',
+        '你把布人烧了，把点心原样送了回去，附笺一张：“妹妹的手艺，还是自己留着用吧。”',
+        { e: { wang: 4, zhi: 2 } }
+      ], else: [
+        '你收下了。三日后慈宁宫的嬷嬷“例行查检”，从匣子夹层里翻出了一只小布人。',
+        '你百口莫辩。最终是皇帝一句“小孩子的玩意儿，不必大惊小怪”压了下去。但他看你的眼神，淡了。',
+        { e: { chong: -10, wang: -6 } }
+      ] }
+    ], else: [
+      '晚棠在揽月阁的暖阁里见你。炭火很旺，她的手却是凉的。',
+      ['wt', '姐姐，我如今什么都有了。娘的病好了，弟弟在周家的私塾念书，我是婕妤。', 's'],
+      ['wt', '我夜里常梦见储秀宫。梦见那床被子。醒来的时候，身上盖的是蜀锦。', 'd'],
+      { if: s => s.aff.wt >= 15, then: [['wt', '姐姐，我只说一遍，你听过就忘了。', 'n'], ['wt', '冬至那夜，慈宁宫的酒，一口也别喝。', 'n'], { f: 'wtHint' }] },
+      { e: { wt: 2 } }
+    ] }] }
+  ] });
+
+  E.garden.push({ id: 'hd4', when: s => s.ch >= 4 && (has(s, '半块玉佩') || has(s, '先帝密诏')), scene: [
+    '你求见时，他正在批折子。你什么也没有说，只是把那半块玉佩，放在了他的案头。',
+    '他的笔停了。一滴朱砂落在奏折上，慢慢洇开。',
+    ['hd', '……这是先帝的随身之物。另一半，在朕的生母棺中。朕是这么被告知的。', 'n'],
+    ['me', '皇上，她没有在棺中。', 'n'],
+    ['me', '她在西北角，一道包着铁皮的门后面。十五年了，每夜哄一只布老虎睡觉，叫它“珩儿”。', 'n'],
+    '他站起来，又坐下去。手撑着案沿，指节发白。',
+    ['hd', '朕去过那道门外。七岁那年，朕追一只风筝追到那里，听见里头有人吹笛子。', 'd'],
+    ['hd', '嬷嬷把朕抱走了，说里头关着吃小孩的疯子。朕怕了很多年。', 'c'],
+    ['hd', '朕现在不能去。朕一动，她就没命了。', 'n'],
+    ['hd', '冬至。冬至那夜，朕要亲手，把那道门打开。', 'a'],
+    { e: { chong: 15, hd: 20 }, f: 'hdKnows' }
+  ] });
+
+  E.med.push({ id: 'syOffer', when: s => s.ch >= 4 && s.aff.sy >= 30, scene: [
+    '苏砚在后院晒药。秋阳很好，他挽着袖子，神情比平日松快些。',
+    ['sy', '我向院判递了辞呈。冬至之后，就走。', 'n'],
+    ['sy', '先师的仇，有人替他报了。西北角那位，也总算有人肯听她说话。这宫里，我没有非留不可的理由了。', 'n'],
+    ['sy', '只剩一件。', 'n'],
+    '他没有看你，一片一片地翻着簸箕里的当归。',
+    { if: s => !has(s, '龟息散'), then: [
+      ['sy', '我又配了一剂龟息散。先师的方子缺一味药引，我试了一年。', 'n'],
+      ['sy', '上一剂，你拿去救了别人。这一剂，我想你留给自己。', 'n'],
+      { item: '龟息散' }
+    ] },
+    ['sy', '神武门往南，过三座桥。那间铺子我已经盘下了，后院有一棵很大的桂花树。', 'n'],
+    ['sy', '我不问你来不来。我只是告诉你，那里有一盏灯，每晚都点着。', 's'],
+    { e: { sy: 5 }, f: 'syOffer', ach: 'yizhe' }
+  ] });
+
+  E.cining.push({ id: 'th4', when: s => s.ch >= 4 && s.f.thPact, scene: [
+    '太后今日的佛珠捻得很慢。她把一只指甲盖大的蜡丸，放在你的茶盏旁边。',
+    ['th', '皇帝近来不大听话了。他在查十五年前的事。', 'n'],
+    ['th', '这东西无色无味，每日一点，添在他的参茶里。三个月，神仙也瞧不出。', 'n'],
+    ['th', '宗室里有个三岁的孩子，哀家已经看好了。你做皇后，抚养幼帝。往后这天下，有你一半。', 's'],
+    { c: [
+      { t: '把蜡丸收进袖中', do: [
+        ['th', '好。哀家没有看错人。', 's'],
+        '回去的路上，你把蜡丸在掌心里攥了一路。它很轻，轻得像什么也没有。',
+        { e: { th: 10, ren: -8 }, f: 'poisonHd', item: '蜡丸' }
+      ] },
+      { t: '“太后，这一步，臣妾不走。”', do: [
+        ['th', '…………', 'n'],
+        ['th', '哀家教了你那么多，却忘了教你最要紧的一条。', 'n'],
+        ['th', '知道了哀家的事，又不肯上哀家的船的人——是活不长的。', 'a'],
+        { e: { th: -30, ren: 4 }, f: 'refusedTh' }
+      ] }
+    ] }
+  ] });
+
+  E.shang.unshift({ id: 'rg4', when: s => s.ch >= 4 && s.cai + s.zhi >= 110, scene: [
+    '容姑姑把一摞账册推到你面前，足有半人高。',
+    ['rg', '六局今年的出入总账。尚宫年迈，看不动了，我也理不清。你试试。', 'n'],
+    '你看了三天，挑出十七处错漏，四处贪墨，另附了一页改良支取章程的条陈。',
+    ['rg', '…………', 'n'],
+    ['rg', '我在这宫里三十年，见过的聪明女子不少。她们的聪明，都用在一个男人身上了。', 'n'],
+    ['rg', '尚宫之位明年出缺。那不是妃嫔能坐的位子——要坐，就得把牌子撤了，这辈子不再承宠。', 'n'],
+    ['rg', '我不劝你。只是告诉你，有这么一条路：不靠谁的喜欢，也能在这宫里站着。', 's'],
+    { e: { rg: 8, wang: 6 }, f: 'nvguan' }
+  ] });
+
+  E.home.push({ id: 'home4', when: s => s.ch >= 4 && !s.f.arDead && s.f.arDream, scene: [
+    '阿箬在灯下补你的斗篷。她长高了些，针脚也比两年前细密了。',
+    ['ar', '主子，奴婢今年十八了。还有七年。', 's'],
+    ['ar', '奴婢攒到三十一两啦。就是不知道七年后，桂花还是不是三文钱一碗的价……', 'n'],
+    { c: [
+      { t: '拿出三十两：“不用等七年。我去求恩典，开春就放你出去。”', req: s => s.yin >= 30, tip: '需 银两≥30', do: [
+        ['ar', '主子？！不不不，奴婢走了谁给主子梳头？谁半夜给主子热点心？', 'c'],
+        ['me', '你那铺子，头一碗不是说好了请我？你不出去，我上哪儿喝。', 's'],
+        ['ar', '……呜。', 'c'],
+        '她哭得一塌糊涂，针扎了手也不知道。',
+        ['ar', '那主子一定要来。奴婢给主子留着靠窗的座儿，一直留着。', 's'],
+        { e: { yin: -30, ar: 15, ren: 3 }, f: 'arFree' }
+      ] },
+      { t: '“会涨价的。多攒些吧。”', do: [['ar', '啊……那奴婢再省省。', 'n'], { e: { ar: 2 } }] }
+    ] }
+  ] });
+
+  // ───── 第四章 · 主线：巫蛊案 ─────
+  X.MAIN[4] = { loc: 'fengyi', label: '凤仪宫巫蛊案', scene: [
+    { bg: 'hall' }, { bgm: 'tense' },
+    '十月初九。慈宁宫的掌事嬷嬷带人“清查秽物”，在凤仪宫佛龛之后，搜出一只扎满银针的布偶。',
+    '布偶背后，是皇帝的生辰八字。',
+    '六宫嫔妃被尽数传至凤仪宫正殿。皇后跪在当中，凤冠已被摘下。',
+    ['th', '巫蛊厌胜，诅咒君上。皇帝，这样的人，还配母仪天下么？', 'a'],
+    '皇帝没有说话。他的目光在太后与皇后之间，慢慢地移。',
+    { if: s => s.f.hhAlly, then: [
+      '皇后忽然笑了一声。她站了起来——没有人叫她起来。',
+      ['hh', '儿臣也有一样东西，请母后过目。', 'n'],
+      '那本发黄的脉案，被她掷在太后脚下，摊开的那一页，正是盖着慈宁宫小印的批条。',
+      ['hh', '承熙元年七月，儿臣腹中六个月的皇嗣。母后，那是您的亲孙儿。', 'a'],
+      '满殿死寂。太后的佛珠，停了。',
+      ['th', '……伪造之物。皇后疯了。', 'n'],
+      ['hd', '够了。', 'a'],
+      ['hd', '此事疑点甚多。皇后暂居凤仪宫，无旨不得出。脉案，交大理寺。', 'n'],
+      '那是皇帝登基四年来，第一次没有顺着太后的话往下说。',
+      { c: [
+        { t: '走出人群，站到皇后身侧', do: ['你什么也没说，只是站了过去。皇后没有看你，但她的肩，松下来了一线。', { e: { hh: 8, wang: 6, th: -12 } }] },
+        { t: '留在人群里。此刻不宜出头', do: ['你垂着眼。你们事先约好的——明面上，你与凤仪宫，并无往来。', { e: { zhi: 2 } }] }
+      ] },
+      { f: 'hhSafe' }
+    ], else: [
+      ['th', '你们日日来凤仪宫请安，可曾见过什么异状？谁来说说。', 'n'],
+      '这是在要人递刀。满殿的人，都低下了头。',
+      { c: [
+        { t: '出列：“臣妾曾见凤仪宫夜半焚符。”', if: s => s.f.spy || s.f.thPact, do: [
+          '皇后转过头来，看了你一眼。那一眼里没有恨，只有一点了然，像是早就料到了。',
+          ['hh', '很好。你比本宫当年，学得快。', 'n'],
+          '皇后沈氏废为庶人，迁居静思苑。',
+          { e: { th: 10, wang: 8, chong: 4, ren: -7, hh: -40 }, f: 'hhDeposed' }
+        ] },
+        { t: '出列：“这布偶用的料子，是今秋新贡的蜀锦。”', req: s => s.zhi >= 60 || s.wang >= 50, tip: '需 智谋≥60 或 威望≥50', do: [
+          ['me', '今秋的蜀锦统共十二匹，尚服局的档上记得清楚：八匹入了慈宁宫，四匹入了乾元殿。凤仪宫，一寸也没有。', 'n'],
+          '殿中静了一瞬。皇帝抬起眼来。',
+          ['hd', '传尚服局。', 'n'],
+          '半个时辰后，慈宁宫的掌事嬷嬷“认了罪”，说是自己与皇后有旧怨。她被拖下去时，一直望着太后，太后没有看她。',
+          ['hh', '……为什么帮本宫？', 'n'],
+          ['me', '臣妾还欠娘娘七目棋。', 's'],
+          { e: { hh: 18, wang: 10, th: -18, chong: 4 }, f: 'hhSafe' }
+        ] },
+        { t: '低头，不语', do: [
+          '没有人作证，也没有人辩白。有些时候，沉默就是那把刀。',
+          '皇后沈氏废为庶人，迁居静思苑。她走出凤仪宫时，没有回头。',
+          { f: 'hhDeposed' }
+        ] }
+      ] }
+    ] },
+    { if: s => s.f.refusedTh, then: [
+      { bg: 'night' },
+      '当夜，慈宁宫的小太监送来一壶酒。“太后体恤{cheng}今日受惊，赐酒压惊。”',
+      { if: s => s.chong >= 50 || s.f.hhAlly || s.f.hdKnows, then: [
+        '酒还没递到你手里，门外已响起甲胄声。',
+        { if: s => s.f.hhAlly, then: ['来的是凤仪宫的掌事女官，身后跟着内廷侍卫：“皇后娘娘有令，各宫今夜饮食，一律封存验看。”'], else: ['来的是御前的人：“皇上口谕，{cheng}即刻迁居乾元殿偏阁。”'] },
+        '小太监的脸白了。那壶酒洒在地上，青砖“嗤”地冒起一缕白烟。'
+      ], else: [
+        '小太监跪在那里，不肯走。门外廊下，立着四个你不认得的嬷嬷。',
+        '没有人会来。你站得不够高，也没有人肯为你把门推开。',
+        { end: 'zhenjiu' }
+      ] }
+    ] },
+    { bg: 'room' },
+    { promo: 1 },
+    { ch: 5 },
+    { title: '终章 · 冬至', sub: '承熙四年 · 冬' },
+    '十一月。京城落了第一场雪。',
+    '按祖制，冬至夜，天子须至慈宁宫向太后行家礼，六宫作陪。今年，太后特意传了一班傩戏进宫“驱邪”。',
+    '离冬至还有五旬。该见的人，该做的事——这是最后的余暇了。'
+  ] };
+};
+
+});
+__d("./js/story/ch5",function(require,module,exports){
+module.exports = function (X) {
+  var E = X.EVENTS;
+  var has = (s, it) => s.items.indexOf(it) >= 0;
+
+  E.garden.push({ id: 'hd5', when: s => s.ch === 5 && s.chong >= 40, scene: [
+    '雪后的御池结了薄冰。他站在老地方，肩上落了一层白。',
+    ['hd', '鱼都沉到池底去了。冬天它们不吃食，也不游，就那么熬着，等开春。', 'n'],
+    ['hd', '{name}。冬至那夜，无论发生什么，你站在朕看得见的地方。', 'n'],
+    { if: s => s.f.hdOpen || s.f.hdKnows, then: [
+      ['hd', '朕这一生，身边的人不是想从朕这里拿走什么，就是被朕拿去换了什么。', 'd'],
+      ['hd', '只有你，朕不想拿去换任何东西。', 'n'],
+      { e: { chong: 8, hd: 8 } }
+    ], else: [{ e: { chong: 5 } }] }
+  ] });
+  E.home.push({ id: 'home5', when: s => s.ch === 5, scene: [
+    { if: s => s.f.arDead, then: [
+      '冬至前夜。你一个人坐着，把那只小布袋里的碎银倒出来，一粒一粒地数。',
+      '二十九两。你数了三遍，还是二十九两。',
+      { e: { ren: 1 } }
+    ], else: [
+      '冬至前夜。阿箬包了饺子，偷偷在你那碗里多放了两个。',
+      ['ar', '主子，奴婢老家说，冬至吃了饺子，耳朵就不会冻掉。', 's'],
+      ['ar', '明晚……明晚主子早些回来。奴婢留着灯。', 'd'],
+      '她什么都不知道。但她好像什么都感觉到了。',
+      { e: { ar: 4, mao: 2 } }
+    ] }
+  ] });
+  E.fengyi.push({ id: 'hh5', when: s => s.ch === 5 && s.f.hhAlly && !s.f.hhDeposed, scene: [
+    '凤仪宫名为禁足，内里却灯火通明。皇后面前摊着内廷侍卫的名册，朱笔圈了三十七个名字。',
+    ['hh', '这些是周家安插的人。冬至那夜，他们会“恰好”全部当值在慈宁宫外围——是我排的班。', 'n'],
+    ['hh', '外围，不是内殿。门一关，他们就是瓮里的。', 's'],
+    ['hh', '{name}，事成之后，你想要什么？凤座？我让给你，我是真心的。', 'n'],
+    { c: [
+      { t: '“那娘娘呢？娘娘想要什么？”', do: [
+        '她怔住了。大约从来没有人问过她这个。',
+        ['hh', '我？', 'n'],
+        ['hh', '我想去一个没有人叫我“娘娘”的地方。开间学堂，教女孩子下棋。输了的可以哭，赢了的可以笑出声。', 'd'],
+        ['hh', '……说着玩的。废后哪有活着出宫的道理。', 'n'],
+        ['me', '从前没有。往后未必。', 'n'],
+        { e: { hh: 12 }, f: 'hhDream' }
+      ] },
+      { t: '“等过了冬至再说吧。”', do: [['hh', '也是。先活过那一夜。', 'n'], { e: { hh: 3 } }] }
+    ] }
+  ] });
+
+  // ───── 终章 · 主线：冬至夜 ─────
+  X.MAIN[5] = { loc: 'cining', label: '冬至夜宴', scene: [
+    { bg: 'night' },
+    '冬至，酉时三刻。慈宁宫正殿，百烛高烧。',
+    '傩戏班子戴着狰狞的鬼面，在殿前踏着鼓点。你数了数，四十八人。他们的步子太齐了，不像戏子。',
+    { bg: 'hall' },
+    '酒过三巡。太后放下了酒盏。',
+    ['th', '皇帝。哀家昨夜梦见先帝了。', 'n'],
+    ['th', '先帝问哀家：景珩登基四年，宠信奸佞，戕害功臣，冷落中宫，至今无嗣。这江山，他坐得稳么？', 'a'],
+    { sfx: 'gong' }, { bgm: 'tense' },
+    '殿外，钟声响了。一下，两下，三下。',
+    '鼓点停了。四十八张鬼面同时摘下，露出四十八副甲胄。',
+    // 毒线
+    { if: s => s.f.poisonHd, then: [
+      '皇帝想站起来。他撑着案沿，晃了晃，一口血喷在了明黄的桌围上。',
+      '三个月了。那枚蜡丸，你每日刮下一点，添在他的参茶里。',
+      '他倒下去之前，目光越过所有人，落在你脸上。没有惊愕。他好像，早就知道。',
+      ['hd', '……看鱼的人。', 'd'],
+      '那是他说的最后四个字。',
+      { if: s => s.zhi >= 70 && s.ren <= -8, then: [{ go: 'end_nvdi' }], else: [{ go: 'end_zhenjiu_th' }] }
+    ] },
+    ['hd', '母后要废朕？', 'n'],
+    ['th', '哀家是替先帝，替列祖列宗，清理门户。', 'n'],
+    { if: s => has(s, '先帝密诏'), then: [
+      '就是现在。',
+      '你从席间站起来，走到大殿正中，展开了那卷发脆的黄绫。',
+      ['me', '太后口口声声先帝托梦。巧了——先帝，也有话留下。', 'n'],
+      ['me', '“朕若暴崩，必周氏所为。云妃未死，囚于西宫。皇六子景珩，云氏所出，朕之骨血。见此诏者，如朕亲临。”', 'n'],
+      '朱砂御印在烛火下，鲜红如血。甲士们的刀尖，一寸一寸地垂了下去——他们吃的是周家的粮，可没有人敢对着先帝遗诏拔刀。',
+      ['th', '…………', 'n'],
+      ['th', '十五年。哀家把这宫里的地砖翻了三遍。', 'n'],
+      { if: s => s.f.gfSaved && s.f.wtEvidence && s.f.hhAlly && !s.f.hhDeposed && !s.f.arDead, then: [{ go: 'end_manyuan' }] },
+      // 普通密诏线
+      '殿门洞开。风雪里，苏砚扶着一个披着旧云锦披风的妇人，一步一步，走了进来。',
+      ['ys', '周姐姐。十五年不见，你老了。', 'n'],
+      '皇帝手里的酒盏落了地。',
+      ['hd', '…………娘？', 'c'],
+      { if: s => s.f.wtEvidence, then: ['晚棠自末席走出，跪在御前，双手呈上那道盖着凤印的手令。她的声音在抖，却一个字也没有停。'] },
+      { if: s => s.f.wtDark && !s.f.wtEvidence, then: ['林婕妤站在太后身后，脸色惨白。她袖中那包本该下在御酒里的东西，终究没有来得及用。', '三日后，揽月阁传出消息：林氏自缢。案头压着一支生了锈的银簪，簪头是半朵海棠。', { f: 'wtDead' }] },
+      '周氏一党，当夜尽数下狱。太后被“请”回佛堂，自此再未出过那道门。',
+      '没有人为她求情。也没有人，敢去问她最后说了什么。',
+      { go: 'finalChoice' }
+    ] },
+    // 无密诏：太后党
+    { if: s => s.f.thPact && !s.f.refusedTh, then: [{ go: 'end_kuilei' }] },
+    // 无密诏：血战
+    ['hd', '母后以为，这四年，朕当真只会喂鱼？', 'a'],
+    '他摔了杯。屏风后、梁柱间、殿门外，禁军的弩机同时上了弦。',
+    { if: s => s.f.hhAlly && !s.f.hhDeposed, then: ['皇后排的班起了作用：周家安插的三十七名侍卫被关在外围的瓮城里，一个也没能进来。'] },
+    { if: s => s.f.wtEvidence, then: ['晚棠自末席冲出，将太后的手令高举过头：“傩戏班是周家私兵！臣妾有太后亲笔为证！”', '一支流矢擦着她的鬓角钉进柱子。她没有躲。'] },
+    '那一夜，慈宁宫的金砖被血洗了三遍。',
+    { if: s => s.f.wtDark && !s.f.wtEvidence, then: ['乱军中，有人看见林婕妤扑在太后身前。她是真心护主，还是只是来不及逃，没有人知道了。', '清点尸首时，她手里攥着一支生了锈的银簪。', { f: 'wtDead' }] },
+    '天亮时，皇帝独自从殿里走出来，龙袍的下摆是暗红的。',
+    ['hd', '太后周氏，暴病而崩。', 'n'],
+    '他说这句话的时候，声音平得像御池结了冰的水面。',
+    '他赢了。只是从那以后，再没有人见他去喂过鱼。',
+    { f: 'bloody' },
+    { go: 'finalChoice' }
+  ] };
+
+  X.SCENES.finalChoice = [
+    { bg: 'garden' },
+    '尘埃落定。雪停了三日，又下起来。',
+    { if: s => s.f.ysTruth && has(s, '先帝密诏'), then: ['云太妃迁居寿康宫。皇帝每日晨昏都去，有时只是坐着，听她吹一支很旧的曲子。'] },
+    { if: s => s.f.gfSaved, then: ['北境来了一封没有落款的信，只有一行字，笔锋张扬：“兰草替我多晒晒。——活着的人”'] },
+    '腊月初八，皇帝在御池边召见你。',
+    ['hd', '你想要什么？只要朕给得起。', 'n'],
+    { q: '你想要什么？', c: [
+      { t: '呈上父亲的手札：“臣妾想要一个公道。”', if: s => s.origin === 'zc' && has(s, '父亲手札'), do: [{ go: 'end_zhaoxue' }] },
+      { t: '“臣妾想要的，在神武门往南，三座桥外。”', if: s => has(s, '龟息散') && s.f.syOffer, do: [{ go: 'end_jianghu' }] },
+      { t: '“请皇上准废后沈氏出宫。臣妾……想同她一道走。”', if: s => s.f.hhAlly && !s.f.hhDeposed && s.aff.hh >= 40, do: [{ go: 'end_shuanghe' }] },
+      { t: '“臣妾请撤绿头牌，入尚宫局。”', if: s => s.f.nvguan, do: [{ go: 'end_nvguan' }] },
+      { t: '“臣妾哪儿也不去。就在这里。”', do: [
+        { if: s => s.chong >= 60 && s.wang >= 50, then: [{ go: 'end_huanghou' }], else: [
+          { if: s => s.chong >= 40, then: [{ go: 'end_chongguan' }], else: [
+            { if: s => s.chong + s.wang >= 45, then: [{ go: 'end_baitou' }], else: [{ go: 'end_lenggong' }] }
+          ] }
+        ] }
+      ] },
+      { t: '“臣妾想去皇觉寺，带发修行。”', do: [{ go: 'end_qingdeng' }] }
+    ] }
+  ];
+};
+
+});
+__d("./js/story/endings",function(require,module,exports){
+module.exports = function (X) {
+  var S = X.SCENES;
+  var has = (s, it) => s.items.indexOf(it) >= 0;
+  var arEpi = { if: s => s.f.arFree && !s.f.arDead, then: ['开春，阿箬出宫了。她走的时候抱着包袱哭了一路，又笑了一路。', '后来有南边回来的人说，江边新开了间糖水铺子，桂花的、红豆的，三文钱一碗。靠窗有个座儿，掌柜的从来不让人坐。'] };
+
+  S.end_manyuan = [
+    '殿门洞开。风雪涌进来，吹得百烛齐齐一矮。',
+    '走在最前面的，是皇后沈令仪。她没有戴凤冠，身后是六宫嫔妃、六局女官，黑压压站满了丹陛。',
+    ['hh', '内廷侍卫三十七名周氏党羽，已尽数缴械。母后，您的瓮，儿臣替您扎紧了。', 'n'],
+    '晚棠自末席走出，跪在御前，双手呈上那道盖着凤印的手令。她发间，簪着半朵银海棠。',
+    ['wt', '罪妾林氏，受太后胁迫，中秋下毒、冬至谋逆，桩桩属实。罪妾愿以身证之。', 'n'],
+    '宫门外传来马蹄声。传令兵滚鞍下马，声音都劈了：',
+    '“报——！北境顾家军旧部三千轻骑已至城下！打的是‘清君侧’的旗！领军的是……是个女将！十箭九中！”',
+    ['th', '……顾家的丫头。她没死。', 'n'],
+    '太后第一次，缓缓地转过头来，看着你。',
+    ['th', '是你。', 'n'],
+    ['th', '皇后、林氏、顾氏、藏书阁的老东西、太医院的小大夫……哀家一颗一颗摆了十五年的子，你一颗一颗，全捡走了。', 'n'],
+    ['th', '哀家教过那么多人。她们学会了狠，学会了忍，学会了踩着别人往上走。', 'n'],
+    ['th', '只有你，学了个哀家不会的。', 's'],
+    { bgm: 'theme' },
+    '最后进来的，是苏砚。他扶着一个披着旧云锦披风的妇人。',
+    '她走得很慢。十五年没有走过这样长的路了。',
+    ['ys', '珩儿。', 's'],
+    ['ys', '你长这么高了。夜里……还怕不怕黑？', 'c'],
+    '皇帝手里的酒盏落了地。他张了张口，像个七岁的孩子那样，发不出声音。',
+    ['hd', '…………娘。', 'c'],
+    '那一夜，慈宁宫没有流一滴血。',
+    '四十八副甲胄卸在殿前，堆成一座小小的铁山。太后自己摘下了凤钗，放在案上，走进了佛堂。门，是她自己关上的。',
+    { bg: 'garden' },
+    '来年春天。',
+    '顾廷岳一案平反。新任的镇北将军姓顾，是本朝头一位女将军。她回京述职那天，径直去了昭阳宫，把一盆兰草抱走了。',
+    ['gf', '养得还行。算你有良心。', 's'],
+    '皇后沈氏自请去位。皇帝准了，另赐黄金千两、江南宅院一所。她走的那天，只带了一副棋。',
+    ['hh', '{name}，你欠我的七目，我记着。来江南还。', 's'],
+    '晚棠削去位份，罚入皇觉寺三年。临行前，她把完整的一对海棠簪，都留给了你。',
+    ['wt', '等我出来，还我一支。只还一支。', 's'],
+    '云太妃住进了寿康宫。有人常看见年轻的天子坐在她脚边的小杌子上，听她吹一支很旧的曲子，听着听着，就睡着了。',
+    arEpi,
+    { if: s => s.origin === 'zc' && has(s, '父亲手札'), then: ['同年，承平十九年御史{xing}氏一案重审。圣旨上的最后一句是：“忠直敢言，蒙冤八载，朕甚愧之。”', '你把父亲的手札烧在了他坟前。', { ach: 'qingbai' }] },
+    { bg: 'garden' },
+    '至于你——',
+    '御池的冰化了。他又站在柳树下撒鱼食，听见你的脚步声，没有回头。',
+    ['hd', '{name}，你说，这池子里的鱼，是自在，还是可怜？', 's'],
+    ['me', '臣妾答过了。', 'n'],
+    ['hd', '朕想再听一遍。这一回，朕把宫门打开了听。', 's'],
+    '风从神武门的方向吹过来。满园的海棠，开得比哪一年都好。',
+    { ach: 'manyuan' },
+    { end: 'manyuan' }
+  ];
+
+  S.end_huanghou = [
+    { bg: 'hall' },
+    ['hd', '那么，朕给你一样你没有开口要的东西。', 'n'],
+    '承熙五年正月，册后大典。',
+    { if: s => s.f.hhAlly && !s.f.hhDeposed, then: ['沈氏自请去位，把凤印亲手交到你掌中。', ['hh', '椅子，还是棺材，往后由你自己定。', 'n']], else: ['凤仪宫的封条揭了下来。你跨过那道门槛时，想起有个人曾在这里，对着一局残棋，下了很多年。'] },
+    '凤冠九龙四凤，重三斤十一两。戴上的那一刻，你的脖颈不由自主地挺直了。',
+    '百官山呼千岁。你隔着十二旒珠帘，看见御座上的那个人向你伸出手来。',
+    { if: s => s.f.bloody || s.f.hdTrue, then: ['那只手很稳，也很凉。你握住了。', '你知道这只手签过什么样的旨意。你也知道，从今往后，你要学着不去想。'], else: ['那只手，是暖的。', ['hd', '{name}，高处易先春。可高处也冷——往后，朕与你一处冷着。', 's']] },
+    arEpi,
+    { end: 'huanghou' }
+  ];
+  S.end_chongguan = [
+    { bg: 'hall' },
+    ['hd', '好。那便在这里。', 's'],
+    '承熙五年春，晋{xing}氏为皇贵妃，位同副后，赐居昭阳宫。',
+    '昭阳宫。你站在那扇窗下，窗台上有一圈浅浅的印子，是曾经放过一只花盆的地方。',
+    '他待你很好。赏赐流水般地来，夜里常常留宿，生辰那日，他巳时说来，巳时便来了。',
+    '只是朝臣们说，{xing}氏出身不足以正位中宫。他听了，笑一笑，没有争。',
+    '你也没有争。你已经学会了，不去数他哪一次的笑，是到了眼睛里的。',
+    arEpi,
+    { end: 'chongguan' }
+  ];
+  S.end_baitou = [
+    { bg: 'room' },
+    ['hd', '……也好。', 'n'],
+    '他后来又选过三次秀。新人像春天的花，一茬一茬地开。',
+    '你不争，也不怨。逢年节领一份赏，逢初一十五请一回安。日子像檐下的雨水，一滴一滴，不知不觉就满了一缸。',
+    '许多年后，你的头发白了。新入宫的小宫女围着你，要听从前的故事。',
+    '“姑姑，听说昭阳宫从前住过一位顶厉害的贵妃娘娘？”“听说冷宫里关过先帝的妃子？”',
+    '你望着窗外的海棠，想了很久。',
+    ['me', '都忘了。', 's'],
+    { end: 'baitou' }
+  ];
+  S.end_lenggong = [
+    { bg: 'cold' },
+    ['hd', '就在这里？', 'n'],
+    ['hd', '{cheng}，朕问的是你想要什么，不是问你想留在哪。你在朕这里，原也没有什么位置。', 'a'],
+    '他走了。你后来才明白，那一问不过是客气。',
+    '新人进宫，旧人腾地方。一句“御前失仪”，你被迁去了西北角——那道包着铁皮的门后面。',
+    '院子里有一口枯井，井沿上有两道浅浅的凹痕，是从前有人常年坐在那里磨出来的。',
+    '你也坐了下来。',
+    { end: 'lenggong' }
+  ];
+  S.end_qingdeng = [
+    { bg: 'cold' },
+    ['hd', '……你想清楚了？', 'n'],
+    ['me', '想清楚了。臣妾在这宫里，看得够多了。', 'n'],
+    '皇觉寺在西山。山门外有一株老梅，你去的那天，正开着。',
+    { if: s => s.f.arDead, then: ['你在佛前供了一盏长明灯，灯下压着一张叠得很小的纸，纸上画着一间铺子。'] },
+    { if: s => s.f.gfDead, then: ['每年四月十九，你会多诵一卷经。不为超度，只是觉得那个人性子急，黄泉路上，怕是没耐心等。'] },
+    '木鱼声里，前尘如雪落。',
+    '有香客说，西山上有位师太，生得极好，也极静，像是把一辈子的话，都在别处说完了。',
+    { end: 'qingdeng' }
+  ];
+  S.end_nvguan = [
+    { bg: 'study' },
+    ['hd', '撤牌子？你可知这意味着什么。', 'n'],
+    ['me', '意味着臣——不再是“臣妾”了。', 's'],
+    '他看了你很久，忽然笑了。是御池边那种，到了眼睛里的笑。',
+    ['hd', '准。', 's'],
+    '承熙五年，{xing}氏入尚宫局，次年掌印，人称“{xing}尚书”。',
+    '你裁冗员、清贪墨、定章程。六局二十四司三千宫人，头一回有了“年满二十五，无论有无恩典，一律放归”的明文。',
+    ['rg', '这一条，是为谁加的？', 'n'],
+    { if: s => s.f.arDead, then: [['me', '为一个差十一两银子的人。', 'd']], else: [['me', '为一个想开糖水铺子的人。', 's']] },
+    arEpi,
+    '后世修史，《承熙实录·宫闱志》里有你一页。不在后妃列传，在职官。',
+    { end: 'nvguan' }
+  ];
+  S.end_shuanghe = [
+    { bg: 'garden' },
+    '他怔了很久。',
+    ['hd', '废后出宫，本朝没有先例。', 'n'],
+    ['me', '皇上打开过一道十五年没人敢开的门。先例，是人开的。', 'n'],
+    ['hd', '……朕这一生，好像总是在送人走。', 'd'],
+    ['hd', '准了。走的时候，别来辞行。朕怕朕会反悔。', 'n'],
+    '承熙五年二月，沈氏、{xing}氏同日离宫。一辆青帷小车，和你们入宫时坐的，是一个样子。',
+    '车过神武门，沈令仪掀开了帘子。这是你们头一回，在这道门里，光明正大地往外看。',
+    ['hh', '{name}。往后别叫娘娘了。', 's'],
+    ['hh', '叫令仪。', 's'],
+    '江南，栖梧书院。只收女学生。两位先生，一个教棋，一个教琴。',
+    '棋室的墙上挂着一副对子，是沈先生的字：“输了可以哭，赢了笑出声。”',
+    arEpi,
+    { end: 'shuanghe' }
+  ];
+  S.end_jianghu = [
+    { bg: 'night' },
+    '他没有听懂。你也没有解释，只是行了一个极郑重的大礼。',
+    '腊月二十三，小年。{cheng}“急病”，太医苏砚诊过，摇了摇头。',
+    '停灵三日。第三日夜里，棺盖被人从外面轻轻推开。',
+    ['sy', '十二个时辰，一刻不差。', 's'],
+    ['sy', '能走么？不能的话——冒犯了。', 'n'],
+    '他把你背了起来。他的背比看上去宽，袖口有当归和艾草的气味。',
+    { bg: 'gate' },
+    '神武门往南，过三座桥。',
+    '那间铺子没有挂招牌。后院的桂花树下，摆着两把竹椅，一盏灯。',
+    ['sy', '我说过，每晚都点着。', 's'],
+    '史书上，{xing}氏薨于承熙四年冬，年二十。',
+    '同年，江南多了一间医馆。坐堂的大夫话很少，抓药的娘子生得极好，偶尔吹笛。病人们都说，那笛声听了，夜里睡得安稳。',
+    arEpi,
+    { end: 'jianghu' }
+  ];
+  S.end_zhaoxue = [
+    { bg: 'study' },
+    '他接过那本巴掌大的手札，一页一页地翻。翻到最后一页，他合上，双手递还给你。',
+    ['hd', '你姓什么？', 'n'],
+    '八年了。你第一次，在这宫里，说出了自己真正的姓氏。',
+    ['hd', '……原来你入宫，不是为朕。', 'd'],
+    ['me', '是。臣女欺君，甘愿领罪。', 'n'],
+    ['hd', '你父亲查的，是朕生母的案子。他为朕的母亲死了，朕却让他的女儿改名换姓，在这宫里熬了两年。', 'n'],
+    ['hd', '该领罪的，是朕。', 'd'],
+    '承熙五年春，承平十九年御史一案重审。圣旨最后一句写的是：“忠直敢言，蒙冤八载，朕甚愧之。”',
+    { bg: 'gate' },
+    '清明，你出了宫。祠堂里，父亲的牌位重新立了起来，木头是新的，还有松香味。',
+    '你把手札烧在他坟前。纸灰很轻，被风一吹，就过了山。',
+    ['me', '爹。我没有信卷宗。', 'c'],
+    { ach: 'qingbai' },
+    arEpi,
+    { end: 'zhaoxue' }
+  ];
+  S.end_kuilei = [
+    { bg: 'hall' },
+    '皇帝摔了杯。屏风后，禁军的弩机上了弦——',
+    '然后，一支也没有射出来。',
+    ['th', '皇帝是在等这些人么？', 's'],
+    '禁军统领走出来，跪在了太后脚边。他昨夜收到的那份“皇帝欲尽诛禁军将领”的名单，是你亲手誊抄的。',
+    '承熙帝萧景珩，“自愧失德”，退居南苑。三个月后，“忧惧而崩”。',
+    '三岁的新帝登基。你戴着凤冠，抱着那个不停哭闹的孩子，坐在帘子前面。太后坐在帘子后面。',
+    ['th', '孩子哭，就让他哭。你坐直些。', 'n'],
+    ['th', '哀家说“准”，你便说“准”。哀家咳一声，你便说“再议”。记住了？', 'n'],
+    { if: s => s.f.wtDark, then: ['新晋的林贵妃立在一旁，向你盈盈一笑。你认得那个笑——那是在等你出错的笑。'] },
+    '你坐直了。凤冠三斤十一两，每一两，都有一根线牵着。',
+    { end: 'kuilei' }
+  ];
+  S.end_nvdi = [
+    { bg: 'hall' },
+    '殿中大乱。太后站起身，声音压过了所有人：',
+    ['th', '皇帝暴崩！哀家以先帝遗孀之名，立宗室子景——', 'a'],
+    ['me', '太后。', 'n'],
+    '你没有起身。你甚至还端着酒盏。',
+    ['me', '臣妾这三个月，每日往皇上的参茶里添东西。可添的那只手，戴的是慈宁宫秦嬷嬷的镯子。验毒的银针、经手的宫人、蜡丸上的指纹——每一样，都指着慈宁宫。', 'n'],
+    ['me', '禁军统领昨夜收到的名单，是您的笔迹。周家私兵的花名册，在大理寺卿的案头。', 'n'],
+    ['me', '您教过臣妾：说谎的人，手比嘴先动。可您没留意，这三个月，臣妾的手一直很稳。', 's'],
+    '太后看着你。很久。然后她竟然笑了，是那种师父看见徒弟出师的笑。',
+    ['th', '好。好得很。', 's'],
+    ['th', '哀家十四岁入宫，以为这辈子不会输。原来是要输给自己教出来的东西。', 'n'],
+    ['th', '丫头，这把椅子，比你想的冷。你坐上去就知道了。', 'n'],
+    { ach: 'zhuxin' },
+    '周氏“弑君”，满门下狱。你以贵妃之尊抚育三岁新帝，垂帘听政，改元“昭宁”。',
+    { bg: 'night' },
+    '昭宁十年。朝臣称你“圣后”，史官的笔，在你面前不敢落重了。',
+    '夜深时你偶尔会走到御池边。池子里的鱼换过许多茬了，一撒食就聚过来，撒完了就散。',
+    '你忽然想不起，从前是谁问过你一个关于鱼的问题，你又是怎么答的。',
+    { end: 'nvdi' }
+  ];
+  S.end_zhenjiu_th = [
+    { bg: 'hall' },
+    '皇帝“暴崩”。新帝登基的诏书，当夜便拟好了。',
+    '你等着太后兑现她的话。等来的，是秦嬷嬷手里的一只托盘。',
+    ['th', '弑君是诛九族的罪。总得有个人来认。', 'n'],
+    ['th', '哀家教过你那么多，你怎么偏偏没学会最要紧的一条——', 'n'],
+    ['th', '替人做脏事的手，事成之后，是要剁掉的。', 's'],
+    '你想辩白。可是银针、蜡丸、经手的宫人，每一样都指着你。她连这个，也替你预备好了。',
+    { end: 'zhenjiu' }
+  ];
+};
+
+});
+__d("./js/story/index",function(require,module,exports){
+// 剧情数据总表
+// 剧本写法： '旁白'  |  ['角色id或名字', '台词', '表情 n/s/d/a/c']  |  { 指令 }
+// 指令：bgm 临时换配乐（theme/court/night/cold/tense，换景后自动恢复） sfx 播放音效
+// 指令：c 选项  if/then/else 分支  e 属性变化  f 立旗标  item/drop 物品  ach 成就  bg 换景  go 跳转  end 结局  ch 进入章节  title 章节卡
+var SCENES = {}, EVENTS = {}, DEFAULTS = {}, MAIN = {};
+var ctxObj = { SCENES: SCENES, EVENTS: EVENTS, DEFAULTS: DEFAULTS, MAIN: MAIN };
+require('./prologue')(ctxObj);
+require('./ch1')(ctxObj);
+require('./ch2')(ctxObj);
+require('./ch3')(ctxObj);
+require('./ch4')(ctxObj);
+require('./ch5')(ctxObj);
+require('./endings')(ctxObj);
+
+var XING = ['沈', '苏', '陆', '谢', '温', '裴', '江', '姜', '叶', '宋', '阮', '虞', '秦', '孟', '白'];
+var MING = ['知微', '清晏', '昭昭', '令窈', '疏桐', '栖梧', '念卿', '蘅芜', '听雪', '南枝', '云舒', '照晚', '月见', '青禾', '书意', '晚晴'];
+function randName() { return XING[Math.floor(Math.random() * XING.length)] + MING[Math.floor(Math.random() * MING.length)]; }
+
+var ORIGINS = {
+  sx: { name: '书香清流', tag: '智谋+12 才艺+8', desc: '祖父曾任国子祭酒，家无余财，唯书满架。你识得字里的刀，也读得懂沉默。', add: { zhi: 12, cai: 8 }, yin: 30 },
+  jm: { name: '将门之女', tag: '家世+16 容貌+4', desc: '父兄戍边，军功赫赫。你骑过马、见过血，膝盖比旁人硬三分——这在宫里未必是好事。', add: { jia: 16, mao: 4 }, yin: 40 },
+  sg: { name: '商贾巨富', tag: '银两120 容貌+6', desc: '江南首富的掌上明珠。世人轻商，可你早就明白：这世上的门，十扇里有九扇是银子敲开的。', add: { mao: 6, jia: 4 }, yin: 120 },
+  xl: { name: '小吏之女', tag: '可分配点数+12', desc: '父亲是九品主簿，你是被凑数送进来的。没人对你有期待——所以你可以长成任何样子。', add: {}, yin: 20, pts: 42 },
+  zc: { name: '罪臣之后', tag: '隐藏出身 · 智谋+8 才艺+8', desc: '八年前，御史父亲因“构陷宫闱”问斩。你改了姓，顶着远房表亲的名字入宫。你不为恩宠而来。', add: { zhi: 8, cai: 8, jia: -5 }, yin: 15, lock: 1 }
+};
+var RANKS = ['采女', '才人', '美人', '婕妤', '昭仪', '妃', '贵妃', '皇贵妃'];
+var LOCS = [
+  { id: 'home', name: '寝居', desc: '梳妆、歇息，阿箬在侧', bg: 'room', col: '#d99a8a' },
+  { id: 'garden', name: '御花园', desc: '花木深处，偶有圣驾', bg: 'garden', col: '#7fbfa0' },
+  { id: 'library', name: '藏书阁', desc: '旧档、旧书与旧人', bg: 'study', col: '#a88a5a' },
+  { id: 'music', name: '乐坊', desc: '丝竹管弦之地', bg: 'room', col: '#c98ab0' },
+  { id: 'fengyi', name: '凤仪宫', desc: '皇后沈氏居所', bg: 'hall', col: '#4a7a9a' },
+  { id: 'zhaoyang', name: '昭阳宫', desc: '贵妃顾氏居所', bg: 'hall', col: '#c9545a' },
+  { id: 'cining', name: '慈宁宫', desc: '太后居所，檀香不散', bg: 'hall', col: '#6a4a7a' },
+  { id: 'med', name: '太医院', desc: '药香里有个不爱说话的人', bg: 'study', col: '#7a9ab8' },
+  { id: 'shang', name: '尚宫局', desc: '规矩、人情与打点', bg: 'room', col: '#5a7a66' },
+  { id: 'tang', name: '棠梨院', desc: '晚棠的住处', bg: 'garden', col: '#e39aa6' },
+  { id: 'cold', name: '冷宫', desc: '宫城西北角，无人提起', bg: 'cold', col: '#8a8e9c' }
+];
+var CHAPTERS = {
+  0: { title: '序章 · 选秀', time: '承熙三年 · 早春', ap: 0 },
+  1: { title: '第一章 · 初入宫闱', time: '承熙三年 · 春', ap: 5 },
+  2: { title: '第二章 · 中秋夜宴', time: '承熙三年 · 秋', ap: 6 },
+  3: { title: '第三章 · 风起', time: '承熙四年 · 春', ap: 6 },
+  4: { title: '第四章 · 凤位', time: '承熙四年 · 秋', ap: 6 },
+  5: { title: '终章 · 冬至', time: '承熙四年 · 冬', ap: 5 }
+};
+var FULL = { me: '', wt: '林晚棠', gf: '贵妃 · 顾明珠', hh: '皇后 · 沈令仪', th: '太后', hd: '皇上 · 萧景珩', sy: '太医 · 苏砚', ar: '阿箬', rg: '容姑姑', ys: '云氏' };
+
+var ACH = [
+  { id: 'ruGong', name: '初入宫闱', desc: '走过那道门。门在身后合上的声音，你会记很多年。' },
+  { id: 'yiming', name: '一鸣惊人', desc: '殿选之上，被那个人多看了一眼。', hint: '在殿选中拿出你最强的一面。' },
+  { id: 'zhiji', name: '看鱼的人', desc: '你说，可怜的是看鱼的人。他很久没有说话。', hint: '御池边，给出一个只有聪明人才给得出的回答。' },
+  { id: 'mingcha', name: '明察秋毫', desc: '中秋夜宴上，你看见了那只真正下毒的手。', hint: '夜宴之前，多听听身边人说了什么。' },
+  { id: 'zheliu', name: '折柳', desc: '你在太后面前奏了那支不该奏的曲子。', hide: 1, clue: '乐坊深处有支旧曲，老乐师叮嘱你别在某人面前吹。' },
+  { id: 'hongzhu', name: '红烛泪', desc: '阿箬替你认下了所有的罪。她攒的银子还差十一两。', hide: 1, clue: '中秋夜宴上，若你百口莫辩、一句话也说不出……' },
+  { id: 'bufu', name: '糖水铺子', desc: '阿箬出宫了。她的铺子开在江边，桂花糖水三文一碗。', hint: '有人想要的东西很小，小到很容易被忘记。' },
+  { id: 'beizi', name: '那夜的被子', desc: '你没有揭发她。因为储秀宫最冷的那一夜，被子是她分你一半的。', hide: 1, clue: '查出下毒之人后，还有另一种做法。' },
+  { id: 'tangli', name: '棠梨如故', desc: '晚棠把太后的手令放在你掌心。两支海棠簪终于又并在一处。', hide: 1, hard: 1, clue: '救出一个被扣在城南庄子上的孩子。' },
+  { id: 'lancao', name: '向阳处', desc: '你把那盆兰草搬到了太阳底下。', hint: '有人走的时候，只托付了一件很小的事。' },
+  { id: 'mingzhu', name: '明珠不暗投', desc: '白绫悬在梁上，而顾明珠活着走出了京城。', hide: 1, hard: 1, clue: '太医院有一剂能让人“死去”十二个时辰的药。' },
+  { id: 'luozi', name: '落子无悔', desc: '皇后掀了棋盘。两年来她第一次不再晨昏定省。', hide: 1, clue: '把一本发黄的脉案，推到棋盘中央。' },
+  { id: 'lenggong', name: '冷宫的笛声', desc: '一曲《折柳》，疯了十五年的人，清醒了一炷香。', hide: 1, clue: '冷宫枯井边，有人哼的曲子总是断在一半。' },
+  { id: 'mizhao', name: '第三根柱子', desc: '藏书阁的地砖下，压着先帝最后的话。', hide: 1, hard: 1, clue: '看阁老人拂尘时，总绕开第三根柱子。他在等半块玉佩。' },
+  { id: 'yizhe', name: '医者', desc: '他说，这一剂，我想你留给自己。', hide: 1, clue: '那位不爱说话的太医，待你的心意要足够深。' },
+  { id: 'quanshu', name: '执棋之手', desc: '太后说：哀家可以让你做下一个皇后。你接过了那盏茶。', hide: 1, clue: '替慈宁宫做事，并在她问你想要什么时，说要站得高些。' },
+  { id: 'qingguo', name: '倾国', desc: '容貌达到九十。', hint: '容貌达到九十。' },
+  { id: 'yongxu', name: '咏絮之才', desc: '才艺达到九十。', hint: '才艺达到九十。' },
+  { id: 'zhuge', name: '女中诸葛', desc: '智谋达到九十。', hint: '智谋达到九十。' },
+  { id: 'dengtian', name: '一步登天', desc: '在冬至之前，位至贵妃。', hint: '在终章之前晋封贵妃。', hard: 1 },
+  { id: 'guajia', name: '孤家寡人', desc: '你走到了最后。回头看时，身后一个人也没有。', hide: 1, hard: 1, clue: '位极人臣，而阿箬、贵妃、晚棠、皇后，一个都没留住。' },
+  { id: 'zhuxin', name: '诛心', desc: '你用太后教你的一切，送走了太后。', hide: 1, hard: 1, clue: '接过太后的蜡丸，再比她更狠、更聪明。' },
+  { id: 'qingbai', name: '清白', desc: '八年了。父亲的名字，终于可以刻回祠堂。', hide: 1, hard: 1, clue: '只有带着旧案入宫的人，才能拿到。' },
+  { id: 'manyuan', name: '满园春色', desc: '没有一个人死去。你大概不知道这有多难。', hide: 1, hard: 1, clue: '冬至夜，让所有人都活下来。' },
+  { id: 'fanhua', name: '看尽繁华', desc: '抵达五种不同的结局。', hint: '抵达五种不同的结局。' },
+  { id: 'ming', name: '万般皆是命', desc: '抵达全部结局。半点不由人？未必。', hint: '抵达全部结局。', hard: 1 }
+];
+var ACH_MAP = {}; for (var i = 0; i < ACH.length; i++) ACH_MAP[ACH[i].id] = ACH[i];
+
+var ENDS = {
+  manyuan: { name: '海晏河清', good: 1, bg: 'garden', epi: '那年冬至没有流血。来年春天，御花园的海棠开得比哪一年都好。', hint: '所有人都活着——这是最难的一条路。' },
+  huanghou: { name: '母仪天下', good: 1, bg: 'hall', epi: '凤冠很重。你终于明白，她当年说的“椅子与棺材”是什么意思。', hint: '圣宠与威望，缺一不可。' },
+  chongguan: { name: '宠冠六宫', good: 1, bg: 'hall', epi: '他待你很好。只是每逢落雪，你会想起昭阳宫里另一个被他“待得很好”的人。', hint: '君恩深重，然威望不足以正位中宫。' },
+  nvdi: { name: '凤临天下', good: 1, bg: 'night', epi: '垂帘之后，再无人敢直视你的眼睛。你赢了所有人，包括从前的自己。', hint: '向最危险的人学艺，然后青出于蓝。' },
+  jianghu: { name: '江湖夜雨', good: 1, bg: 'gate', epi: '{xing}氏薨于承熙四年冬。同年，江南多了一间不挂招牌的医馆。', hint: '宫墙之外，有人在等一个“已死”之人。' },
+  zhaoxue: { name: '沉冤昭雪', good: 1, bg: 'gate', epi: '你把父亲的手札烧在他坟前。纸灰很轻，被风一吹，就过了宫墙。', hint: '只有带着旧案入宫的人，才走得到这里。' },
+  nvguan: { name: '女尚书', good: 1, bg: 'study', epi: '你不再是谁的妃子。六局二十四司的印信，比任何恩宠都握得稳。', hint: '才与智，足以让人忘记你原是来做妃子的。' },
+  shuanghe: { name: '双鹤归山', good: 1, bg: 'garden', epi: '废后沈氏与{xing}氏同日离宫。江南有间女学，两位先生一个教棋，一个教琴。', hint: '凤座上的人，也在等一个开口的理由。' },
+  qingdeng: { name: '青灯古佛', good: 0, bg: 'cold', epi: '木鱼声里，前尘如雪落。有人说你是看破，只有你知道，是看够了。', hint: '放下，也是一种走法。' },
+  baitou: { name: '白头宫女', good: 0, bg: 'room', epi: '许多年后，新入宫的小宫女问你从前的事。你想了想，说：都忘了。', hint: '不争不抢，平平淡淡地活到最后。' },
+  lenggong: { name: '冷宫残雪', good: 0, bg: 'cold', epi: '西北角的雪化得最晚。你学会了数砖，一共三千七百二十一块。', hint: '失了圣心，也无人为你说话。' },
+  zhenjiu: { name: '一杯鸩酒', good: 0, bg: 'night', epi: '酒是温的。送酒的小太监不敢看你，他的手抖得比你厉害。', hint: '宫里有些路，走错一步就没有下一步。' },
+  kuilei: { name: '傀儡凤冠', good: 0, bg: 'hall', epi: '你坐上了凤座。帘子后面那只手，提着你每一根线。', hint: '站在胜利者身后，不等于自己赢了。' }
+};
+var END_LIST = ['manyuan', 'huanghou', 'chongguan', 'nvdi', 'jianghu', 'zhaoxue', 'nvguan', 'shuanghe', 'qingdeng', 'baitou', 'lenggong', 'zhenjiu', 'kuilei'];
+
+module.exports = { SCENES: SCENES, EVENTS: EVENTS, DEFAULTS: DEFAULTS, MAIN: MAIN, ORIGINS: ORIGINS, ORIGIN_LIST: ['sx', 'jm', 'sg', 'xl', 'zc'], RANKS: RANKS, LOCS: LOCS, CHAPTERS: CHAPTERS, FULL: FULL, ACH: ACH, ACH_MAP: ACH_MAP, ENDS: ENDS, END_LIST: END_LIST, randName: randName };
+
+});
+__d("./js/story/prologue",function(require,module,exports){
+module.exports = function (X) {
+  X.SCENES.prologue = [
+    { bg: 'gate' },
+    { title: '序章 · 选秀', sub: '承熙三年 · 早春' },
+    '承熙三年，早春。新帝登基后的第一次大选。',
+    '四百辆青帷小车自神武门鱼贯而入。车帘是不许掀的，你只能从缝隙里看见一线朱红的宫墙，很高，高得看不见头。',
+    { if: s => s.origin === 'zc', then: [
+      '你摸了摸袖中那张路引。上面的姓氏不是你的——{xing}，是远房表舅家的姓。',
+      '八年前，父亲被押出府门那天，回头对你说的最后一句话是：“别信卷宗。”',
+      '你今天进这道门，不是为了恩宠。'
+    ] },
+    { if: s => s.origin === 'jm', then: ['临行前，父亲把你的弓收了起来。“宫里用不上这个，”他说，“宫里的箭，不带响。”'] },
+    { if: s => s.origin === 'sg', then: ['母亲往你的箱笼夹层里塞满了银票。“别心疼，”她说，“银子是会说话的，比人说得好听。”'] },
+    { if: s => s.origin === 'sx', then: ['祖父送你到巷口，只说了一句：“多看，少说。书上写的，一半是假的；人嘴里说的，一多半是假的。”'] },
+    { if: s => s.origin === 'xl', then: ['家里没人来送你。县里凑不够秀女的数，主簿的女儿便被添了上去。你带的包袱，比同车的姑娘小一半。'] },
+    '车停了。你下车时，身旁一个穿杏粉衫子的姑娘绊了一下，发间一支簪子落在青砖上，“叮”的一声。',
+    '她僵在那里，脸白得像纸。管事太监的眼睛已经扫了过来——御前失仪，是可以当场撂牌子的。',
+    { c: [
+      { t: '俯身替她拾起，顺势挡住太监的视线', do: [
+        '你借着整理裙摆蹲下去，簪子滑进袖中，再起身时，已悄悄塞回她手里。',
+        ['wt', '多……多谢姐姐。我叫林晚棠，海棠的棠。', 's'],
+        ['wt', '我娘说，进了宫要先学会不出声。可我连路都还没学会走。', 'n'],
+        { e: { wt: 10, ren: 1 }, f: 'wtKind' }
+      ] },
+      { t: '低声提醒：“别动，等他转过身再捡。”', do: [
+        '她听了你的，果然等到太监回头的一瞬才弯腰。',
+        ['wt', '姐姐好稳的心。我叫林晚棠……往后，能跟着姐姐么？', 'n'],
+        { e: { wt: 6, zhi: 1 } }
+      ] },
+      { t: '目不斜视。这里不是能管闲事的地方', do: [
+        '你从她身边走了过去。身后传来太监尖细的呵斥，和一声压得很低的抽泣。',
+        '后来你才知道，她叫林晚棠。那天她挨了十下手板，没有哭出声。',
+        { e: { wt: -4, zhi: 1 } }
+      ] }
+    ] },
+    '队伍行至夹道，前头忽然净了街。一乘八人抬的绛红步辇自昭阳宫方向而来，金铃细响。',
+    '秀女们齐齐跪下。辇上的人没有叫起，只隔着纱帘，慢慢地看过来。',
+    ['gf', '抬起头来。', 'n'],
+    ['gf', '……倒有几分颜色。可惜这宫里，最不缺的就是颜色。', 'a'],
+    { if: s => s.origin === 'jm', then: [
+      ['gf', '等等。陇西{xing}家的？我爹提过你爹——说他是个只会打仗的直肠子。', 'n'],
+      ['gf', '将门的女儿，膝盖别这么软。看着碍眼。', 's'],
+      { e: { gf: 5 } }
+    ] },
+    '步辇远去。有人小声说：那是贵妃顾氏，镇北大将军的独女，皇上心尖上的人。',
+    { bg: 'hall' },
+    '殿选设在体元殿。六人一排，轮到你时，殿中已燃尽了三炉香。',
+    '上首三个人。正中的年轻男子着玄色常服，神情温和，目光却像隔着一层水。左侧凤冠端严，是皇后。右侧——',
+    '右侧那位妇人捻着佛珠，眼皮都没有抬。可你一进殿，就觉得被她看完了。',
+    { if: s => s.origin === 'zc', then: [
+      ['th', '这孩子……抬头，让哀家瞧瞧。', 'n'],
+      ['th', '眉眼倒叫哀家想起一个故人。罢了，许是哀家老了。', 'n'],
+      '你垂着眼，指甲掐进了掌心。'
+    ] },
+    ['hd', '可有所长？', 'n'],
+    { c: [
+      { t: '献舞一支', req: s => s.cai >= 22, tip: '需 才艺≥22', do: [
+        '没有乐师，你便以足尖点地为拍。水袖收回时，殿中静了一息。',
+        ['hd', '好。', 's'], { e: { chong: 8, wang: 3 }, f: 'xuanOK' }
+      ] },
+      { t: '请皇上出题，愿以诗对', req: s => s.zhi >= 22, tip: '需 智谋≥22', do: [
+        ['hd', '便以这殿外的柳为题。', 'n'],
+        ['me', '“不是东风偏着意，由来高处易先春。”', 'n'],
+        '皇后的目光第一次落在你脸上。太后捻佛珠的手停了一停。',
+        ['hd', '高处易先春……有意思。', 's'], { e: { chong: 8, wang: 3 }, f: 'xuanOK' }
+      ] },
+      { t: '只是抬起头，安静地让他看', req: s => s.mao >= 22, tip: '需 容貌≥22', do: [
+        '你什么也没说。殿外一线天光正落在你的侧脸上。',
+        ['hd', '……留牌子。', 'n'], { e: { chong: 9 }, f: 'xuanOK' }
+      ] },
+      { t: '自报家门，请太后与皇后娘娘教导', req: s => s.jia >= 22, tip: '需 家世≥22', do: [
+        ['hh', '{xing}家的女儿，规矩是好的。', 'n'],
+        ['th', '嗯。', 'n'], { e: { wang: 8, chong: 3, hh: 3 }, f: 'xuanOK' }
+      ] },
+      { t: '“民女愚钝，并无所长。”', do: [
+        ['hd', '倒是实诚。', 'n'],
+        '你听见身后有秀女轻笑。但牌子，终究是留下了——大约是凑数。',
+        { e: { chong: 2 } }
+      ] }
+    ] },
+    { if: s => s.f.xuanOK, then: [{ rank: 1 }, { ach: 'yiming' }, '当晚旨意下来：{xing}氏，封才人。同批四十人里，初封便得才人位的，只有三个。'], else: ['当晚旨意下来：{xing}氏，封采女。最末一等，住最偏的屋子。'] },
+    { bg: 'night' },
+    '储秀宫的夜比你想的冷。炭是不够的，被子薄得透风。',
+    '你睁着眼躺到半夜，听见有人赤着脚，窸窸窣窣地摸到你榻边。',
+    ['wt', '姐姐，你也没睡着吧？', 'n'],
+    ['wt', '我的被子厚些，是我娘絮的新棉。咱们并在一处盖，好不好？', 's'],
+    '两床被子叠在一起，终于有了点暖意。她的脚冰凉，小心地不敢碰着你。',
+    ['wt', '姐姐，我封了采女。我娘还病着，我原想着……算了。', 'd'],
+    ['wt', '这个给你。是一对儿的，我一支，你一支。', 'n'],
+    '她把一支小小的银簪放进你手心，簪头錾着半朵海棠。',
+    ['wt', '往后不管谁先出了头，都别忘了今晚这床被子。拉钩。', 's'],
+    { item: '海棠簪' }, { e: { wt: 5 } },
+    { if: s => s.origin === 'xl', then: ['你们都是没人撑腰的。这一点，不必说出口。', { e: { wt: 5 } }] },
+    { bg: 'room' },
+    '三日后，你搬进了自己的屋子。分来的宫女只有一个，十五六岁，一双眼睛圆圆的。',
+    ['ar', '奴婢阿箬，给主子请安！奴婢力气大，会梳十二种头，还会偷偷热点心——啊，最后一句主子当没听见。', 's'],
+    '教引的姑姑随后进来。四十上下，深青宫装，脸上像是从来没有过表情。',
+    ['rg', '我姓容，尚宫局司正。往后三个月，{cheng}的规矩归我教。', 'n'],
+    ['rg', '只教一句要紧的：在这宫里，你看见的每一件事，都有人想让你看见。', 'n'],
+    ['rg', '想明白是谁想让你看见，再决定要不要“看见”。', 'n'],
+    { ach: 'ruGong' },
+    { ch: 1 },
+    { title: '第一章 · 初入宫闱', sub: '每一旬的余暇有限。去哪里、见谁，由你自己定。' },
+    '（宫中各处皆可走动。每去一处会消耗一次“余暇”；标着「主线」的去处会推进剧情，推进之后，这一章未做的事便再无机会。）'
+  ];
+};
+
+});
+__r("./js/main");
+</script></body></html>
